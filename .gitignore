@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.benchmarks/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime lake data is generated, never committed.
+data/*
+!data/.gitkeep
+
+# Local validation scratch files.
+audit.json
+pytest.out

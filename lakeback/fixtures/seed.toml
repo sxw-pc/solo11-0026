@@ -1,0 +1,87 @@
+# Deterministic synthetic lake tables. No real people or businesses are represented.
+seed = 20240517
+
+[partitioning]
+column = "dt"
+values = ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
+
+[backfill]
+table = "orders"
+modify_rows = 6
+delete_rows = 2
+add_rows = 3
+
+[tables.orders]
+rows = 1500
+key = "order_id"
+id_start = 100000
+
+[[tables.orders.columns]]
+name = "order_id"
+type = "int"
+
+[[tables.orders.columns]]
+name = "user_id"
+type = "int"
+
+[[tables.orders.columns]]
+name = "amount"
+type = "float"
+
+[[tables.orders.columns]]
+name = "status"
+type = "str"
+
+[[tables.orders.columns]]
+name = "dt"
+type = "str"
+
+[tables.users]
+rows = 300
+key = "user_id"
+id_start = 5000
+
+[[tables.users.columns]]
+name = "user_id"
+type = "int"
+
+[[tables.users.columns]]
+name = "region"
+type = "str"
+
+[[tables.users.columns]]
+name = "tier"
+type = "str"
+
+[[tables.users.columns]]
+name = "updated_at"
+type = "str"
+
+[[tables.users.columns]]
+name = "dt"
+type = "str"
+
+[tables.refunds]
+rows = 450
+key = "refund_id"
+id_start = 900000
+
+[[tables.refunds.columns]]
+name = "refund_id"
+type = "int"
+
+[[tables.refunds.columns]]
+name = "order_id"
+type = "int"
+
+[[tables.refunds.columns]]
+name = "amount"
+type = "float"
+
+[[tables.refunds.columns]]
+name = "reason"
+type = "str"
+
+[[tables.refunds.columns]]
+name = "dt"
+type = "str"
