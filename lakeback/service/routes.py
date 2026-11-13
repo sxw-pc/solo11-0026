@@ -11,6 +11,9 @@ from lakeback._util import partition_filters
 from lakeback.backfill.report import load_report
 from lakeback.config import Config
 from lakeback.errors import NotFoundError, RequestError
+from lakeback.lineage.graph import downstream, upstream
+from lakeback.lineage.resolve import resolve_target
+from lakeback.lineage.store import LineageStore
 from lakeback.snapshot.ledger import Ledger
 from lakeback.travel.diff import diff_versions
 from lakeback.travel.reader import read_view
@@ -105,6 +108,31 @@ def api_report(config: Config, query: dict[str, list[str]]) -> Response:
     return json_response(load_report(config.reports_dir, report_id))
 
 
+def _lineage_target(ledger: Ledger, query: dict[str, list[str]]) -> dict:
+    return resolve_target(
+        ledger,
+        snapshot=_single(query, "snapshot", required=False),
+        table=_single(query, "table", required=False),
+        at=_single(query, "at", required=False),
+    )
+
+
+def api_lineage_upstream(config: Config, query: dict[str, list[str]]) -> Response:
+    ledger = Ledger(config.ledger_dir)
+    manifest = _lineage_target(ledger, query)
+    store = LineageStore(config.ledger_dir, ledger)
+    return json_response(upstream(ledger, store, manifest["snapshot_id"]))
+
+
+def api_lineage_downstream(config: Config, query: dict[str, list[str]]) -> Response:
+    ledger = Ledger(config.ledger_dir)
+    manifest = _lineage_target(ledger, query)
+    has_limit = _single(query, "limit", required=False) is not None
+    limit = _integer(query, "limit", 0) if has_limit else None
+    store = LineageStore(config.ledger_dir, ledger)
+    return json_response(downstream(ledger, store, manifest["snapshot_id"], limit=limit))
+
+
 def dispatch(config: Config, path: str, query_string: str) -> Response:
     if path in {"/", "/index.html"}:
         return index_response()
@@ -117,4 +145,8 @@ def dispatch(config: Config, path: str, query_string: str) -> Response:
         return api_diff(config, query)
     if path == "/api/backfill/report":
         return api_report(config, query)
+    if path == "/api/lineage/upstream":
+        return api_lineage_upstream(config, query)
+    if path == "/api/lineage/downstream":
+        return api_lineage_downstream(config, query)
     raise NotFoundError(f"unknown route: {path}")

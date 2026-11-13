@@ -26,7 +26,7 @@ def render_generated(result: dict) -> str:
 
 
 def render_snapshot(manifest: dict) -> str:
-    return "\n".join([
+    lines = [
         f"snapshot {manifest['snapshot_id']}",
         f"  table: {manifest['table']}  version: {manifest['version']}",
         f"  parent: {manifest['parent_id']}",
@@ -34,7 +34,57 @@ def render_snapshot(manifest: dict) -> str:
         f"  rows/files/bytes: {manifest['row_count']} / "
         f"{manifest['file_count']} / {manifest['total_bytes']}",
         f"  partitions: {json.dumps(manifest['partitions'], sort_keys=True)}",
-    ])
+    ]
+    lineage = manifest.get("lineage")
+    if lineage is not None:
+        lines.append(f"  lineage sources: {_source_list(lineage['sources'])}")
+    return "\n".join(lines)
+
+
+def _source_list(sources: list[dict]) -> str:
+    if not sources:
+        return "(none: source table)"
+    return ", ".join(f"{source['table']}={source['version']}" for source in sources)
+
+
+def render_lineage_registered(result: dict) -> str:
+    state = "registered" if result["created"] else "already registered (unchanged)"
+    lines = [
+        f"lineage {state} for {result['snapshot_id']}",
+        f"  table: {result['table']}  version: {result['version']}",
+        f"  sources: {_source_list(result['sources'])}",
+    ]
+    if result["unresolved"]:
+        lines.append(f"  unresolved (not in ledger): {_source_list(result['unresolved'])}")
+    return "\n".join(lines)
+
+
+def _render_lineage_walk(result: dict) -> str:
+    root = result["root"]
+    lines = [f"{result['direction']} of {root['table']} v{root['version']} "
+             f"({root['snapshot_id']})"]
+    if not result["entries"]:
+        lines.append("  (no linked snapshots)")
+    for entry in result["entries"]:
+        marker = "" if entry["status"] == "resolved" else "  [dangling: not in ledger]"
+        lines.append(
+            f"  depth {entry['depth']}: {entry['table']} v{entry['version']} "
+            f"{entry['snapshot_id'] or '-'}{marker}"
+        )
+    if result["truncated"]:
+        lines.append(
+            f"  ... truncated: showing {result['entry_count']} of "
+            f"{result['total_count']}; raise --limit to see more"
+        )
+    return "\n".join(lines)
+
+
+def render_lineage_upstream(result: dict) -> str:
+    return _render_lineage_walk(result)
+
+
+def render_lineage_downstream(result: dict) -> str:
+    return _render_lineage_walk(result)
 
 
 def render_travel(result: dict) -> str:

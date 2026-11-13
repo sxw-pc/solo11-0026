@@ -7,6 +7,7 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_NOT_FOUND = 3
 EXIT_RESIDUAL = 4
+EXIT_CYCLE = 5
 
 
 class LakeBackError(Exception):
@@ -67,3 +68,14 @@ class ResidualDiff(LakeBackError):
     def __init__(self, message: str, *, report: dict | None = None) -> None:
         super().__init__(message)
         self.report = report or {}
+
+
+class LineageCycleError(LakeBackError):
+    """A dependency cycle was found while walking the snapshot lineage graph."""
+
+    code = "lineage_cycle"
+    exit_code = EXIT_CYCLE
+
+    def __init__(self, message: str, *, cycle: list[str] | None = None) -> None:
+        super().__init__(message, details={"cycle": list(cycle or [])})
+        self.cycle = list(cycle or [])

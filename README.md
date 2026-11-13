@@ -7,6 +7,7 @@ LakeBack 是一个**完全离线运行**的本地湖仓版本账本、时间旅�
 它是：
 
 - 本地湖表的**版本账本**：每个快照记录表结构、分区、文件清单、行数、文件大小与 sha256；
+- **跨表血缘登记与影响面检索**：快照可显式声明读取了哪些上游表的哪个版本，支持向上追溯来源链、向下评估版本失效影响面；
 - **时间旅行查询器**：按版本号或时间点读取历史快照，支持 Hive 风格分区裁剪；
 - **回填一致性审计器**：对比回填前后两套目录，给出结构化、可复核的 JSON/Markdown 报告；
 - 一个只监听 loopback、只读、无外部依赖的本地 HTTP 查询服务。
@@ -98,6 +99,19 @@ lakeback diff --table orders --from 1 --to 2
 lakeback diff --table orders --from 1 --to 2 --json
 ```
 
+跨表血缘（建快照时声明来源，或事后补登记；查询可向上追溯、向下评估影响面）：
+
+```bash
+# 建快照时显式声明读取了 orders 的第 2 版；可重复传 --source
+lakeback snapshot --table orders_agg --source orders=2
+# 对已存在的快照补登记；不传 --source 表示声明为源表
+lakeback lineage register --table user_revenue --at 1 --source orders=2
+# 向上递归列出完整上游来源链（按嵌套深度分层）
+lakeback lineage upstream --table orders_agg --at 1
+# 向下列出所有直接或间接依赖 orders v2 的快照；--limit 截断时会明确标注
+lakeback lineage downstream --table orders --at 2 --limit 10
+```
+
 回填审计（默认 fixture 会得到 `residual_diff`，所以退出码为 **4**）：
 
 ```bash
@@ -129,6 +143,8 @@ curl http://127.0.0.1:5000/api/tables
 curl "http://127.0.0.1:5000/api/travel?table=orders&at=2&limit=5"
 curl "http://127.0.0.1:5000/api/diff?table=orders&from=1&to=2"
 curl "http://127.0.0.1:5000/api/backfill/report?report_id=<report_id>"
+curl "http://127.0.0.1:5000/api/lineage/upstream?table=orders_agg&at=1"
+curl "http://127.0.0.1:5000/api/lineage/downstream?table=orders&at=2&limit=10"
 ```
 
 浏览器打开 `http://127.0.0.1:5000/` 可使用内置极简查询页；页面资源全部内联，无 CDN。
@@ -162,6 +178,17 @@ pytest -q
 
 `diff` 以 `lakeback.toml` 的 `[keys].<table>` 为主键（表必须有该键）。输出新增行、删除行和修改行的字段级 before/after；三种列表均按主键升序（数字键按数值排序），不依赖文件系统遍历顺序。字段变更顺序遵循 snapshot schema，确定可复现。
 
+### 跨表血缘语义
+
+- **登记**：`snapshot --source 表=版本`（可重复）在建快照时声明来源；`lineage register` 对已存在的快照补登记，不带 `--source` 表示显式声明为源表。血缘按 `(表, 版本)` 显式钉住，与时间旅行解析无关：上游表之后追加新版本、旧版本被时间点查询绕开，都不影响已登记血缘的指向。
+- **存储与校验**：血缘记录写入账本目录的 `data/ledger/lineage.jsonl`，与快照账本相同的逐条 hash 链（`previous_hash + canonical_json(entry)`）。每次加载账本（任何命令、任何查询）都会先完整校验血缘文件的结构、hash 链和与快照账本的交叉引用；手工改动任何一个字节都会在**加载阶段**被拒绝，而不是等到查询时。
+- **幂等**：同一快照重复登记相同来源集（顺序无关、自动去重）不会产生重复记录；以不同来源重复登记会被拒绝（血缘不可变）。
+- **悬空引用**：允许登记指向账本中尚不存在（或已找不到）的 `表=版本`。登记响应的 `unresolved` 会立即列出它们；上游查询中这些条目以 `status="dangling"`、`snapshot_id=null` 明确标出，不会被静默忽略。
+- **上游查询**（`lineage upstream`）：从给定快照出发递归列出完整来源链。每条结果带 `depth`（根为 0，直接来源为 1，依此类推；菱形汇合取最浅深度）、`via`（指向它的直接下游快照）和 `status`。无血缘记录的快照视为隐式源表（`declared=false`）。
+- **下游查询**（`lineage downstream`）：从给定 `表@版本` 出发，按嵌套深度列出所有直接或间接依赖它的快照。`--limit N` 可限制返回条数；一旦截断，结果中 `truncated=true` 且 `total_count` 给出完整总数，不会让人误以为已列全。
+- **循环依赖**：上游/下游查询在返回任何结果之前先对可达子图做完整探环；发现环即整体失败，不输出部分结果。CLI 退出码为 **5**，错误信息带成环快照的标识（如 `snap-aaa (cyc_a v1) -> snap-bbb (cyc_b v1) -> snap-aaa (cyc_a v1)`）；HTTP 返回结构化 400，`error.code="lineage_cycle"`，`error.details.cycle` 列出成环快照 ID。
+- **退出码**：找不到表/版本/快照为 3；血缘成环为 5；参数或登记冲突为 2；成功为 0。
+
 ## 4. 回填审计的判定规则与三类结论
 
 `backfill-audit` 比较两套目录并执行五项检查，报告中的 `checks` 会给出每项的判定依据：
@@ -192,7 +219,7 @@ lakeback/
 ├── lakeback/
 │   ├── __init__.py
 │   ├── __main__.py
-│   ├── cli.py / cli_render.py / cli_diagnostics.py
+│   ├── cli.py / cli_render.py / cli_diagnostics.py / cli_lineage.py
 │   ├── config.py / errors.py / _util.py / _toml.py / tables.py
 │   ├── backends/
 │   │   ├── __init__.py / base.py
@@ -200,6 +227,8 @@ lakeback/
 │   │   └── parquet_backend.py
 │   ├── snapshot/
 │   │   ├── ledger.py / manifest.py / snapshotter.py
+│   ├── lineage/
+│   │   ├── store.py / graph.py / resolve.py
 │   ├── travel/
 │   │   ├── resolver.py / reader.py / diff.py
 │   ├── backfill/
@@ -212,13 +241,14 @@ lakeback/
 ├── data/                       # 运行时生成；仓库内仅保留 .gitkeep
 │   ├── lake/
 │   ├── fixtures/{before,after}/
-│   ├── ledger/{snapshots.jsonl,index.json}
+│   ├── ledger/{snapshots.jsonl,index.json,lineage.jsonl}
 │   ├── snapshots/<snapshot_id>/
 │   └── reports/
 └── tests/
     ├── conftest.py
     ├── test_config.py / test_backends.py / test_snapshot.py
     ├── test_travel.py / test_diff.py / test_backfill_audit.py
+    ├── test_lineage.py
     ├── test_service.py / test_cli.py / test_fixtures.py
 ```
 
@@ -271,9 +301,9 @@ pytest -q
 pytest --cov=lakeback --cov-report=term-missing
 ```
 
-测试全部使用 `tmp_path`，不访问网络、不写用户 home。覆盖范围包括：配置错误分支、两种后端、快照幂等、账本 hash 链/索引篡改检测、版本与时间边界、分区裁剪、diff 确定性、三种审计结论、HTTP 正常与 4xx/405、非法绑定、CLI 退出码 0/2/3/4、fixture 字节确定性。
+测试全部使用 `tmp_path`，不访问网络、不写用户 home。覆盖范围包括：配置错误分支、两种后端、快照幂等、账本 hash 链/索引篡改检测、血缘登记幂等/冲突/悬空引用/成环拒绝/血缘文件篡改加载期拒绝、版本与时间边界、分区裁剪、diff 确定性、三种审计结论、HTTP 正常与 4xx/405、非法绑定、CLI 退出码 0/2/3/4/5、fixture 字节确定性。
 
-最近一次本地统计（详见文末验证记录）：**97 passed**，`lakeback` 包行覆盖率 **84%**；测试 Python 物理行约 1292 行，占 Python 总物理行 4469 行的约 29%（要求 ≥25%）。
+最近一次本地统计（详见文末验证记录）：**131 passed**，`lakeback` 包行覆盖率 **85%**；测试 Python 物理行约 1684 行，占 Python 总物理行 5483 行的约 31%（要求 ≥25%）。
 
 ## 10. 已知边界与明确不实现
 
@@ -291,7 +321,6 @@ pytest --cov=lakeback --cov-report=term-missing
 明确不实现：
 
 - 真正的 ACID 表事务、并发写冲突解决、快照压缩（compaction）与过期清理（vacuum）；
-- 跨表血缘与谱系分析；
 - 流式摄入、CDC、消息队列；
 - 多用户鉴权、租户隔离、远程对象存储后端；
 - SQL 解析与任意查询下推（只支持按表/分区/版本的时间旅行读取与差异）；
@@ -321,9 +350,16 @@ pytest --cov=lakeback --cov-report=term-missing
 | 同目录自比 `backfill-audit` | 0 | `consistent`、`rpt-b5ef89f760bcbe09`；全部计数为 0 |
 | `lakeback travel --table orders --at 99` | 3 | 输出 `no snapshot version 99` 到 stderr |
 | `lakeback snapshot --table ../escape` | 2 | 参数校验拒绝并输出 `lakeback:` 错误 |
-| `pytest -q` | 0 | `97 passed` |
-| 无 pyarrow 屏蔽测试（CSV 降级） | 0 | `93 passed, 1 skipped`；仅 Parquet 对照用例跳过 |
-| `pytest -q --cov=lakeback --cov-report=term` | 0 | 1876 statements / 296 missed / 总覆盖率 84% |
-| 单文件/总量检查 | — | 最大 Python 文件 282 行（≤300）；Python 总计 4469 行（2500–4500） |
+| `lakeback lineage register --table orders_agg --at 1 --source orders=2`（重复执行） | 0 / 0 | 首次 `created=true`，重复 `created=false`；`lineage.jsonl` 保持 1 行不产生重复记录 |
+| `lakeback lineage upstream --table orders_daily --at 1 --json` | 0 | 按 depth 分层列出完整来源链：orders_agg/user_revenue 为 depth 1，orders v2 为 depth 2 |
+| `lakeback lineage downstream --table orders --at 2 --limit 2 --json` | 0 | `entry_count=2`、`total_count=3`、`truncated=true`，截断被明确标注 |
+| 上游追加 orders v3 后 `lineage upstream --table orders_agg --at 1` | 0 | 血缘仍钉在 orders v2；`downstream --table orders --at 3` 为空 |
+| 构造 cyc_a↔cyc_b 后 `lakeback lineage upstream --table cyc_a --at 1` | 5 | stderr 含 `lineage cycle detected` 与两个成环快照的 snapshot_id |
+| 悬空引用 `lakeback lineage upstream --table orphan --at 1 --json` | 0 | 条目 `status="dangling"`、`snapshot_id=null`；登记响应的 `unresolved` 已先行提示 |
+| 将 `lineage.jsonl` 改一个字节后执行任意命令 | 2 | 加载期即报 `lineage record was modified at line N`，不等到查询 |
+| `pytest -q` | 0 | `131 passed` |
+| 无 pyarrow 屏蔽测试（CSV 降级） | 0 | `127 passed, 1 skipped`；仅 Parquet 对照用例跳过 |
+| `pytest -q --cov=lakeback --cov-report=term` | 0 | 2264 statements / 338 missed / 总覆盖率 85% |
+| 单文件/总量检查 | — | 最大 Python 文件 282 行（≤300）；包物理行 3799；含测试总计 5483 行 |
 
-HTTP 验证：以无参数 `python -m lakeback` 在 `127.0.0.1:5000` 启动；`/`、`/api/tables`、`/api/travel`、`/api/diff`、`/api/backfill/report` 均返回 200（例如报告接口返回 `rpt-dc6d2003fd3baf5a` 的 8273 字节 JSON）；未知版本返回结构化 404；`../../etc/passwd` 形式 `report_id` 返回结构化 400；POST 返回 405；`0.0.0.0` 等非 loopback 绑定由配置层和服务层拒绝。
+HTTP 验证：以无参数 `python -m lakeback` 在 `127.0.0.1:5000` 启动；`/`、`/api/tables`、`/api/travel`、`/api/diff`、`/api/backfill/report` 均返回 200（例如报告接口返回 `rpt-dc6d2003fd3baf5a` 的 8273 字节 JSON）；未知版本返回结构化 404；`../../etc/passwd` 形式 `report_id` 返回结构化 400；POST 返回 405；`0.0.0.0` 等非 loopback 绑定由配置层和服务层拒绝。血缘路由 `/api/lineage/upstream`、`/api/lineage/downstream` 返回与 CLI 一致的结构化结果（含 `depth`/`via`/`status`/`truncated`），成环返回 400 且 `error.code="lineage_cycle"`，缺失版本返回 404。

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from lakeback._util import canonical_json, sha256_text
 from lakeback.errors import LedgerError, NotFoundError
+from lakeback.lineage.store import verify_lineage_file
 from lakeback.snapshot.manifest import validate_manifest
 
 LEDGER_FILE = "snapshots.jsonl"
@@ -42,6 +43,9 @@ class Ledger:
                 )
         else:
             self._write_index(expected)
+        # Lineage records travel with the ledger: any tampering is rejected here,
+        # at load time, before any command or query runs.
+        verify_lineage_file(self.directory, self._by_id)
 
     def _load(self) -> None:
         if not self.ledger_path.exists():

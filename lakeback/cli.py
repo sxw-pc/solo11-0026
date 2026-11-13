@@ -9,6 +9,8 @@ import sys
 from lakeback._util import partition_filters
 from lakeback.backfill.auditor import run_audit
 from lakeback.cli_diagnostics import cmd_doctor, cmd_selftest
+from lakeback.cli_lineage import add_lineage_parser, cmd_lineage, register_snapshot_lineage
+from lakeback.lineage.store import parse_source_spec
 from lakeback.cli_render import (
     render_audit,
     render_diff,
@@ -62,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--table", required=True)
     snapshot.add_argument("--table-root", default=None)
     _backend_arg(snapshot)
+    snapshot.add_argument(
+        "--source", action="append", default=None, metavar="TABLE=VERSION",
+        help="declare an upstream table version this snapshot was computed from; repeatable",
+    )
 
     travel = subparsers.add_parser("travel", help="read a table at a snapshot version or time")
     _add_output(travel)
@@ -84,6 +90,8 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--after", required=True)
     audit.add_argument("--key", default=None)
     _backend_arg(audit)
+
+    add_lineage_parser(subparsers)
 
     serve = subparsers.add_parser("serve", help="run the read-only loopback HTTP service")
     serve.add_argument("--host", default=None)
@@ -119,10 +127,19 @@ def cmd_gen_fixtures(config: Config, args) -> int:
 
 
 def cmd_snapshot(config: Config, args) -> int:
+    if args.source is not None:
+        # Validate declarations before anything is appended to the ledger.
+        for raw in args.source:
+            parse_source_spec(raw)
+    ledger = Ledger(config.ledger_dir)
     manifest = create_snapshot(
-        config, args.table, table_root=args.table_root, backend_name=args.backend
+        config, args.table, table_root=args.table_root, backend_name=args.backend, ledger=ledger
     )
-    _emit(args, manifest, render_snapshot)
+    result = manifest
+    if args.source is not None:
+        lineage = register_snapshot_lineage(config, ledger, manifest["snapshot_id"], args.source)
+        result = {**manifest, "lineage": lineage}
+    _emit(args, result, render_snapshot)
     return 0
 
 
@@ -182,6 +199,7 @@ COMMANDS = {
     "travel": cmd_travel,
     "diff": cmd_diff,
     "backfill-audit": cmd_backfill_audit,
+    "lineage": cmd_lineage,
     "serve": cmd_serve,
     "doctor": cmd_doctor,
     "selftest": cmd_selftest,
