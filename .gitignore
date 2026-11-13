@@ -9,11 +9,12 @@ build/
 dist/
 .venv/
 venv/
-
 # Runtime lake data is generated, never committed.
 data/*
 !data/.gitkeep
-
 # Local validation scratch files.
 audit.json
 pytest.out
+node_modules/
+*.pyc
+.env
