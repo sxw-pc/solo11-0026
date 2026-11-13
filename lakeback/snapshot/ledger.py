@@ -6,14 +6,51 @@ import copy
 import json
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
-from lakeback._util import canonical_json, sha256_text
+from lakeback._util import canonical_json, normalise_iso, sha256_text
 from lakeback.errors import LedgerError, NotFoundError
 from lakeback.snapshot.manifest import validate_manifest
 
 LEDGER_FILE = "snapshots.jsonl"
 INDEX_FILE = "index.json"
+LOCK_FILE = ".snapshots.lock"
+
+# Per-directory process locks keep independently constructed Ledger instances
+# (and concurrent threads) from appending based on a stale in-memory view.
+_DIRECTORY_LOCKS: dict[Path, threading.Lock] = {}
+_DIRECTORY_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(directory: Path) -> threading.Lock:
+    with _DIRECTORY_LOCKS_GUARD:
+        return _DIRECTORY_LOCKS.setdefault(directory, threading.Lock())
+
+
+@contextmanager
+def _advisory_file_lock(path: Path):
+    """Best-effort cross-process lock; a no-op where ``fcntl`` is unavailable."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX platforms
+        yield
+        return
+    try:
+        handle = path.open("a+")
+    except OSError:
+        # Read-only deployments still support queries; the lock only guards
+        # writers, so degrade to the in-process lock instead of failing a read.
+        yield
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 class Ledger:
@@ -23,7 +60,8 @@ class Ledger:
         self.directory = Path(ledger_dir).resolve()
         self.ledger_path = self.directory / LEDGER_FILE
         self.index_path = self.directory / INDEX_FILE
-        self._lock = threading.Lock()
+        self.lock_path = self.directory / LOCK_FILE
+        self._lock = _lock_for(self.directory)
         self._records: list[dict] = []
         self._by_table: dict[str, list[dict]] = {}
         self._by_id: dict[str, dict] = {}
@@ -31,11 +69,36 @@ class Ledger:
             self.directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise LedgerError(f"cannot create ledger directory {self.directory}: {exc}") from exc
+        with self._lock, _advisory_file_lock(self.lock_path):
+            self._load()
+            expected = self._build_index()
+            if self.index_path.exists():
+                actual = self._read_index()
+                if actual != expected:
+                    raise LedgerError(
+                        "snapshot index is inconsistent with the append-only ledger",
+                        details={"path": str(self.index_path)},
+                    )
+            else:
+                self._write_index(expected)
+
+    def _reset(self) -> None:
+        self._records = []
+        self._by_table = {}
+        self._by_id = {}
+
+    def _reload(self) -> None:
+        """Re-read the on-disk ledger so a long-lived instance never appends stale.
+
+        The ledger file is authoritative: its hash chain is re-verified by
+        ``_load``.  An index that does not match the freshly recomputed view is
+        still rejected, so the reload cannot mask a tampered derived index.
+        """
+        self._reset()
         self._load()
         expected = self._build_index()
         if self.index_path.exists():
-            actual = self._read_index()
-            if actual != expected:
+            if self._read_index() != expected:
                 raise LedgerError(
                     "snapshot index is inconsistent with the append-only ledger",
                     details={"path": str(self.index_path)},
@@ -150,14 +213,27 @@ class Ledger:
         table = candidate.get("table")
         if not isinstance(table, str):
             raise LedgerError("snapshot manifest is missing table")
-        history = self._by_table.get(table, [])
-        candidate["format"] = 1
-        candidate["version"] = history[-1]["version"] + 1 if history else 1
-        candidate["parent_id"] = history[-1]["snapshot_id"] if history else None
-        validate_manifest(candidate)
-        with self._lock:
-            if candidate["snapshot_id"] in self._by_id:
-                return copy.deepcopy(self._by_id[candidate["snapshot_id"]])
+        with self._lock, _advisory_file_lock(self.lock_path):
+            # Another process or an earlier instance in this process may have
+            # appended since this object was loaded.  Re-read under the lock so
+            # the version/parent decision and the hash chain are based on the
+            # true tail of the ledger.
+            self._reload()
+            existing = self._by_id.get(candidate["snapshot_id"])
+            if existing is not None:
+                return copy.deepcopy(existing)
+            history = self._by_table.get(table, [])
+            candidate["format"] = 1
+            candidate["version"] = history[-1]["version"] + 1 if history else 1
+            candidate["parent_id"] = history[-1]["snapshot_id"] if history else None
+            # Store a canonical UTC spelling so ledger timestamps are
+            # unambiguous and directly comparable no matter how a caller
+            # spelled the clock value.
+            try:
+                candidate["created_at"] = normalise_iso(candidate.get("created_at"))
+            except ValueError as exc:
+                raise LedgerError(f"invalid snapshot created_at: {exc}") from exc
+            validate_manifest(candidate)
             previous_hash = (
                 self._records[-1]["record_hash"] if self._records else ""
             )

@@ -7,6 +7,7 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_NOT_FOUND = 3
 EXIT_RESIDUAL = 4
+EXIT_INTERNAL = 1
 
 
 class LakeBackError(Exception):
@@ -67,3 +68,23 @@ class ResidualDiff(LakeBackError):
     def __init__(self, message: str, *, report: dict | None = None) -> None:
         super().__init__(message)
         self.report = report or {}
+
+
+class InternalError(LakeBackError):
+    """An unexpected failure converted into the same structured error shape."""
+
+    code = "internal_error"
+    exit_code = EXIT_INTERNAL
+
+
+def coerce_error(exc: BaseException) -> LakeBackError:
+    """Map an unexpected exception onto the stable, structured error contract.
+
+    Selector parsing and ledger reads can surface interpreter-level failures
+    (``OverflowError`` for out-of-range instants, ``OSError`` for unreadable
+    files).  Callers must never see an uncaught traceback or the shell's
+    implicit exit code 1, so these become a typed error with a fixed code.
+    """
+    if isinstance(exc, LakeBackError):
+        return exc
+    return InternalError(str(exc) or exc.__class__.__name__, details={"type": exc.__class__.__name__})

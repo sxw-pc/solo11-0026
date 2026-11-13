@@ -6,7 +6,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
-from lakeback._util import NAME_RE, canonical_json, parse_timestamp, sha256_text
+from lakeback._util import NAME_RE, canonical_json, normalise_iso, sha256_text
 from lakeback.backends.base import Schema
 from lakeback.errors import LedgerError
 
@@ -82,6 +82,10 @@ def build_manifest(
     created_at: str,
 ) -> dict:
     snapshot_id, digest = snapshot_id_for_content(table, backend, schema, partitions, files)
+    try:
+        created = normalise_iso(created_at)
+    except ValueError as exc:
+        raise LedgerError(f"invalid snapshot created_at: {exc}") from exc
     return {
         "format": 1,
         "table": table,
@@ -89,7 +93,7 @@ def build_manifest(
         "content_digest": digest,
         "parent_id": None,
         "version": None,
-        "created_at": created_at,
+        "created_at": created,
         "backend": backend,
         "schema": schema_as_list(schema),
         "partitions": partitions,
@@ -123,7 +127,7 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
     if parent is not None and not SNAPSHOT_RE.fullmatch(str(parent)):
         raise LedgerError("manifest parent_id is invalid")
     try:
-        parse_timestamp(manifest["created_at"])
+        normalise_iso(manifest["created_at"])
     except ValueError as exc:
         raise LedgerError(f"manifest created_at is invalid: {exc}") from exc
     schema = manifest["schema"]

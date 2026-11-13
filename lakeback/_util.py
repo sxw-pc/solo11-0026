@@ -34,13 +34,25 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+MIN_UTC = datetime.min.replace(tzinfo=timezone.utc)
+MAX_UTC = datetime.max.replace(tzinfo=timezone.utc)
+
+
 def parse_timestamp(value: str | datetime) -> datetime:
-    """Parse an ISO-8601 instant and normalise it to aware UTC."""
+    """Parse an ISO-8601 instant and normalise it to aware UTC.
+
+    Naive timestamps are interpreted as UTC.  An instant whose UTC spelling
+    would fall outside the representable calendar (for example
+    ``0001-01-01T00:00:00+14:00``) is saturated to the nearest representable
+    bound instead of leaking ``OverflowError``.  Such a value genuinely means
+    "before the earliest snapshot" or "after the latest", so time travel then
+    follows its normal boundary rules and keeps a stable exit code.
+    """
     if isinstance(value, datetime):
         parsed = value
     else:
         text = value.strip()
-        if text.endswith("Z"):
+        if text.endswith(("Z", "z")):
             text = text[:-1] + "+00:00"
         try:
             parsed = datetime.fromisoformat(text)
@@ -48,12 +60,42 @@ def parse_timestamp(value: str | datetime) -> datetime:
             raise ValueError(f"invalid ISO-8601 timestamp: {value!r}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    try:
+        normalised = parsed.astimezone(timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        # ``astimezone`` cannot represent the instant; decide the direction
+        # from the unconverted wall-clock value and saturate.
+        if parsed.year <= 1 and parsed.utcoffset() and parsed.utcoffset().total_seconds() > 0:
+            return MIN_UTC
+        if parsed.year >= 9999 and parsed.utcoffset() and parsed.utcoffset().total_seconds() < 0:
+            return MAX_UTC
+        raise ValueError(f"timestamp is outside the supported range: {value!r}")
+    if normalised < MIN_UTC:
+        return MIN_UTC
+    if normalised > MAX_UTC:
+        return MAX_UTC
+    return normalised
 
 
 def to_iso(moment: datetime) -> str:
     """Stable second-resolution UTC spelling used in manifests."""
     return parse_timestamp(moment).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalise_iso(value: str | datetime) -> str:
+    """Canonical second-resolution UTC spelling for any accepted instant.
+
+    ``created_at`` is always stored through this helper so that the manifest
+    text is unambiguous, second-aligned and directly comparable: an offset
+    string, a naive string and a ``Z`` string that denote the same instant all
+    collapse to the same spelling.
+    """
+    return to_iso(parse_timestamp(value))
+
+
+def second_floor(moment: datetime) -> datetime:
+    """Truncate an aware datetime to whole seconds for ledger comparisons."""
+    return moment.astimezone(timezone.utc).replace(microsecond=0)
 
 
 def utc_now_iso() -> str:

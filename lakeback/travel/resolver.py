@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from lakeback._util import NAME_RE, parse_timestamp, to_iso
+from lakeback._util import NAME_RE, normalise_iso, parse_timestamp, second_floor
 from lakeback.errors import NotFoundError, RequestError
 from lakeback.snapshot.ledger import Ledger
 
@@ -30,7 +30,7 @@ def parse_at(at: Any) -> tuple[str, int | str]:
             raise RequestError("snapshot version must be positive")
         return "version", version
     try:
-        return "timestamp", to_iso(parse_timestamp(text))
+        return "timestamp", normalise_iso(text)
     except ValueError as exc:
         raise RequestError(
             f"invalid snapshot selector {text!r}; expected a version number or ISO-8601 time"
@@ -56,16 +56,27 @@ def resolve_snapshot(ledger: Ledger, table: str, at: Any) -> dict:
         )
     if mode == "latest":
         return history[-1]
-    boundary = parse_timestamp(value)
+    boundary = second_floor(parse_timestamp(value))
     eligible = [
         item for item in history
-        if parse_timestamp(item["created_at"]) <= boundary
+        if second_floor(parse_timestamp(item["created_at"])) <= boundary
     ]
     if not eligible:
-        first = history[0]["created_at"]
-        raise NotFoundError(
-            f"no snapshot for table {table!r} exists at or before {value}",
-            details={"earliest_snapshot": first},
+        first = min(
+            history, key=lambda item: (second_floor(parse_timestamp(item["created_at"])), item["version"])
         )
-    eligible.sort(key=lambda item: (parse_timestamp(item["created_at"]), item["version"]))
-    return eligible[-1]
+        raise NotFoundError(
+            f"no snapshot for table {table!r} exists at or before {value}; "
+            f"earliest snapshot is version {first['version']} at {first['created_at']}",
+            details={
+                "requested_at": value,
+                "earliest_snapshot": first["created_at"],
+                "earliest_version": first["version"],
+            },
+        )
+    # The documented rule is "the latest created_at at or before the boundary,
+    # and for several snapshots in the same second the highest version".
+    return max(
+        eligible,
+        key=lambda item: (second_floor(parse_timestamp(item["created_at"])), item["version"]),
+    )

@@ -17,7 +17,7 @@ from lakeback.cli_render import (
     render_travel,
 )
 from lakeback.config import Config
-from lakeback.errors import LakeBackError, RequestError
+from lakeback.errors import LakeBackError, RequestError, coerce_error
 from lakeback.fixtures.generate import generate_fixtures
 from lakeback.service.app import make_server
 from lakeback.snapshot.ledger import Ledger
@@ -200,18 +200,26 @@ def main(argv: list[str] | None = None) -> int:
         config = Config.load(args.config)
         return int(COMMANDS[args.command](config, args) or 0)
     except LakeBackError as exc:
-        if getattr(args, "json", False):
-            payload = {
-                "error": {
-                    "code": exc.code,
-                    "message": exc.message,
-                    "details": exc.details,
-                }
-            }
-            print(json.dumps(payload, sort_keys=True, indent=2), file=sys.stderr)
-        else:
-            print(f"lakeback: {exc.message}", file=sys.stderr)
+        _report_error(args, exc)
         return exc.exit_code
+    except Exception as exc:  # unexpected: same structured shape, stable exit code
+        error = coerce_error(exc)
+        _report_error(args, error)
+        return error.exit_code
+
+
+def _report_error(args, exc: LakeBackError) -> None:
+    if getattr(args, "json", False):
+        payload = {
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "details": exc.details,
+            }
+        }
+        print(json.dumps(payload, sort_keys=True, indent=2), file=sys.stderr)
+    else:
+        print(f"lakeback: {exc.message}", file=sys.stderr)
 
 
 if __name__ == "__main__":  # pragma: no cover

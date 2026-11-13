@@ -121,3 +121,49 @@ def test_ledger_get_version_and_snapshot(make_config, write_table):
     with pytest.raises(NotFoundError):
         ledger.get_snapshot("snap-" + "0" * 32)
     ledger.verify()
+
+
+def test_restoring_historical_content_reuses_existing_snapshot(make_config, write_table):
+    """Re-materialising an older version must dedupe instead of appending."""
+    config = make_config()
+    _table(config, write_table)
+    first = create_snapshot(config, "orders")
+    _table(config, write_table, _rows("b"))
+    second = create_snapshot(config, "orders")
+    assert second["version"] == 2
+    # Put the exact v1 content back into the lake and snapshot again.
+    _table(config, write_table, _rows("a"))
+    replay = create_snapshot(config, "orders")
+    assert replay["snapshot_id"] == first["snapshot_id"]
+    assert replay["version"] == first["version"] == 1
+    history = Ledger(config.ledger_dir).snapshots("orders")
+    assert [item["version"] for item in history] == [1, 2]
+    assert len((config.ledger_dir / "snapshots.jsonl").read_text().splitlines()) == 2
+
+
+def test_stale_ledger_instance_cannot_duplicate_snapshot(make_config, write_table):
+    """Two Ledger objects loaded before either append must not both append."""
+    config = make_config()
+    _table(config, write_table)
+    stale = Ledger(config.ledger_dir)
+    fresh = Ledger(config.ledger_dir)
+    first = create_snapshot(config, "orders", ledger=stale)
+    second = create_snapshot(config, "orders", ledger=fresh)
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert second["version"] == first["version"] == 1
+    reloaded = Ledger(config.ledger_dir)
+    assert [item["version"] for item in reloaded.snapshots("orders")] == [1]
+    assert len((config.ledger_dir / "snapshots.jsonl").read_text().splitlines()) == 1
+
+
+def test_snapshot_repairs_a_damaged_snapshot_copy(make_config, write_table):
+    """Dedup must heal the immutable copy rather than return a corrupt store."""
+    config = make_config()
+    _table(config, write_table)
+    first = create_snapshot(config, "orders")
+    stored = config.snapshot_store / first["snapshot_id"] / first["files"][0]["path"]
+    stored.write_bytes(stored.read_bytes() + b"corruption")
+    again = create_snapshot(config, "orders")
+    assert again["snapshot_id"] == first["snapshot_id"]
+    assert again["version"] == first["version"] == 1
+    assert len(stored.read_bytes()) == first["files"][0]["size"]

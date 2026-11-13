@@ -148,3 +148,39 @@ def test_cli_json_errors_are_structured(make_config, capsys):
     assert out == ""
     payload = json.loads(err)
     assert payload["error"]["code"] == "not_found"
+
+
+@pytest.mark.parametrize(
+    "selector, exit_code",
+    [
+        ("2000-01-01T00:00:00Z", 3),
+        ("0001-01-01T00:00:00+14:00", 3),
+        ("9999-12-31T23:59:59-14:00", 0),
+        ("not-a-time", 2),
+    ],
+)
+def test_time_selector_exit_codes_are_stable(make_config, capsys, selector, exit_code):
+    config = make_config()
+    code, _, _ = _json_run(capsys, config, "gen-fixtures")
+    assert code == 0
+    code, _, _ = _json_run(capsys, config, "snapshot", "--table", "orders")
+    assert code == 0
+    code, payload, err = _json_run(
+        capsys, config, "travel", "--table", "orders", "--at", selector
+    )
+    assert code == exit_code
+    if exit_code == 0:
+        assert payload["snapshot"]["version"] == 1
+    else:
+        assert payload is None
+        assert json.loads(err)["error"]["code"] in {"not_found", "bad_request"}
+
+
+def test_duplicate_snapshot_cli_reuses_version_and_keeps_ledger(make_config, capsys):
+    config = make_config()
+    _json_run(capsys, config, "gen-fixtures")
+    _, first, _ = _json_run(capsys, config, "snapshot", "--table", "orders")
+    _, second, _ = _json_run(capsys, config, "snapshot", "--table", "orders")
+    assert first["snapshot_id"] == second["snapshot_id"]
+    assert first["version"] == second["version"] == 1
+    assert len((config.ledger_dir / "snapshots.jsonl").read_text().splitlines()) == 1

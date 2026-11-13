@@ -88,15 +88,14 @@ def create_snapshot(
     )
 
     ledger = ledger or Ledger(config.ledger_dir)
-    try:
-        existing = ledger.get_snapshot(manifest["snapshot_id"])
-    except NotFoundError:
-        existing = None
-    if existing is not None:
-        return existing
-
+    # Materialise the immutable copy before consulting the ledger.  Identical
+    # content therefore always targets the same snapshot_id directory; an
+    # interrupted or damaged earlier copy is repaired instead of silently
+    # reused, and the ledger append below performs the idempotent decision.
     snapshot_root = safe_child(config.snapshot_store, manifest["snapshot_id"])
-    for entry, item in zip(entries, files):
-        target = safe_child(snapshot_root, entry.relative)
+    by_path = {entry.relative: entry for entry in entries}
+    for item in files:  # ``files`` and ``entries`` share the same relative paths
+        entry = by_path[item["path"]]
+        target = safe_child(snapshot_root, item["path"])
         _copy_into_store(entry.path, target, item["sha256"])
     return ledger.append(manifest)
