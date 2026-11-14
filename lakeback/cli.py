@@ -7,7 +7,7 @@ import json
 import sys
 
 from lakeback._util import partition_filters
-from lakeback.backfill.auditor import run_audit
+from lakeback.backfill.auditor import run_audit, run_cross_backend_audit
 from lakeback.cli_diagnostics import cmd_doctor, cmd_selftest
 from lakeback.cli_render import (
     render_audit,
@@ -84,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--after", required=True)
     audit.add_argument("--key", default=None)
     _backend_arg(audit)
+    audit.add_argument(
+        "--cross-backend",
+        action="store_true",
+        help="read the directories once per backend and reconcile the verdicts "
+             "after semantic normalisation (nulls, int/float drift, field order)",
+    )
 
     serve = subparsers.add_parser("serve", help="run the read-only loopback HTTP service")
     serve.add_argument("--host", default=None)
@@ -149,10 +155,20 @@ def cmd_diff(config: Config, args) -> int:
 
 
 def cmd_backfill_audit(config: Config, args) -> int:
-    report = run_audit(
-        config, args.table, args.before, args.after,
-        key=args.key, backend_name=args.backend,
-    )
+    if getattr(args, "cross_backend", False):
+        if args.backend is not None:
+            raise RequestError(
+                "--backend cannot be combined with --cross-backend; the cross-backend "
+                "audit reads the directories with every available backend"
+            )
+        report = run_cross_backend_audit(
+            config, args.table, args.before, args.after, key=args.key,
+        )
+    else:
+        report = run_audit(
+            config, args.table, args.before, args.after,
+            key=args.key, backend_name=args.backend,
+        )
     _emit(args, report, render_audit)
     if report["status"] != "consistent":
         print(

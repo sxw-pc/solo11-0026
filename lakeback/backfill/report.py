@@ -12,6 +12,7 @@ STATUS_TEXT = {
     "consistent": "no residual differences were found",
     "residual_diff": "data differences remain after the backfill",
     "structural_mismatch": "schema or partition structure differs",
+    "cross_backend_conflict": "backends disagree even after semantic normalisation",
 }
 
 
@@ -88,6 +89,76 @@ def render_markdown(report: dict) -> str:
                 f"- `{_short(item['partition'])}`: fields "
                 + ", ".join(item["mismatched_fields"])
             )
+    if report.get("audit_mode") == "cross_backend":
+        lines.extend(["", "## Cross-Backend Equivalence", ""])
+        lines.append(
+            "Per-backend status after semantic normalisation: "
+            + ", ".join(
+                f"`{backend}`=**{status}**"
+                for backend, status in sorted(report["backend_statuses"].items())
+            )
+        )
+        normalisation = report["normalisation"]
+        lines.extend(["", "### Normalisation Applied", ""])
+        for rule in normalisation["rules"]:
+            lines.append(f"- {rule}")
+        if normalisation["numeric_type_drift_fields"]:
+            lines.append(
+                "- int/float type drift fields: "
+                + ", ".join(normalisation["numeric_type_drift_fields"])
+            )
+        if normalisation["null_type_spelling_fields"]:
+            lines.append(
+                "- null/str schema spelling fields: "
+                + ", ".join(normalisation["null_type_spelling_fields"])
+            )
+        if normalisation["field_order_reordered"]:
+            lines.append("- schema field order differed and was ignored")
+        if normalisation["fields_with_null_or_empty_values"]:
+            lines.append(
+                "- fields carrying null/empty values: "
+                + ", ".join(normalisation["fields_with_null_or_empty_values"])
+            )
+        lines.extend(["", "### Normalised Fingerprints", ""])
+        for backend, fingerprint in sorted(report["normalised_fingerprints"].items()):
+            lines.append(f"- `{backend}`: `{fingerprint}`")
+        conflicts = report.get("cross_backend_conflicts", [])
+        lines.extend(["", "## Cross-Backend Conflicts", ""])
+        if not conflicts:
+            lines.append("No conflicts: every backend produced the same normalised verdict.")
+        else:
+            for conflict in conflicts:
+                verdicts = ", ".join(
+                    f"`{backend}`={verdict}"
+                    for backend, verdict in sorted(conflict["verdicts"].items())
+                )
+                lines.append(f"- check `{conflict['check']}`: {verdicts}")
+                if "keys" in conflict:
+                    key_detail = conflict["keys"]
+                    lines.append(f"  - primary key: `{key_detail['primary_key']}`")
+                    if key_detail["conflicting_missing_keys"]:
+                        lines.append(
+                            "  - missing-in-after keys: "
+                            + _short(key_detail["conflicting_missing_keys"])
+                        )
+                    if key_detail["conflicting_extra_keys"]:
+                        lines.append(
+                            "  - extra-in-after keys: "
+                            + _short(key_detail["conflicting_extra_keys"])
+                        )
+                    if key_detail["conflicting_modified_keys"]:
+                        lines.append(
+                            "  - modified keys: "
+                            + _short(key_detail["conflicting_modified_keys"])
+                        )
+                if "partitions" in conflict:
+                    lines.append(
+                        "  - partitions: " + _short(conflict["partitions"])
+                    )
+                if "schema" in conflict:
+                    lines.append("  - schema: " + _short(conflict["schema"]))
+                if "row_counts" in conflict:
+                    lines.append("  - row counts: " + _short(conflict["row_counts"]))
     lines.extend([
         "",
         "## Reproduction",

@@ -148,3 +148,43 @@ def test_cli_json_errors_are_structured(make_config, capsys):
     assert out == ""
     payload = json.loads(err)
     assert payload["error"]["code"] == "not_found"
+
+
+def test_cross_backend_audit_cli(make_config, capsys, write_table):
+    pytest.importorskip("pyarrow")
+    from lakeback.backends import get_backend
+
+    config = make_config()
+    schema = {"order_id": "int", "amount": "float", "status": "str", "dt": "str"}
+    rows = [
+        {"order_id": 1, "amount": 10.0, "status": "paid", "dt": "2024-02-01"},
+        {"order_id": 2, "amount": 20.0, "status": "paid", "dt": "2024-02-01"},
+    ]
+    grouped = {"2024-02-01": rows}
+    before = config.project_root / "xb" / "before" / "orders"
+    after = config.project_root / "xb" / "after" / "orders"
+    for root in (before, after):
+        write_table(root, grouped, schema)
+        get_backend("parquet").write_rows(
+            root / "dt=2024-02-01" / "part-00000.parquet", rows, schema
+        )
+
+    code, report, err = _json_run(
+        capsys, config, "backfill-audit", "--table", "orders",
+        "--before", str(before), "--after", str(after), "--cross-backend",
+    )
+    assert code == 0
+    assert report["status"] == "consistent"
+    assert report["audit_mode"] == "cross_backend"
+    assert report["backend_statuses"] == {"csv": "consistent", "parquet": "consistent"}
+    assert report["cross_backend_conflicts"] == []
+    assert err == ""
+
+    # --backend and --cross-backend are mutually exclusive.
+    code, _, err = _run(
+        capsys, config, "backfill-audit", "--table", "orders",
+        "--before", str(before), "--after", str(after),
+        "--cross-backend", "--backend", "csv",
+    )
+    assert code == 2
+    assert "cannot be combined" in err
