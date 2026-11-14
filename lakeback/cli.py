@@ -13,6 +13,7 @@ from lakeback.cli_render import (
     render_audit,
     render_diff,
     render_generated,
+    render_history,
     render_snapshot,
     render_travel,
 )
@@ -23,6 +24,7 @@ from lakeback.service.app import make_server
 from lakeback.snapshot.ledger import Ledger
 from lakeback.snapshot.snapshotter import create_snapshot
 from lakeback.travel.diff import diff_versions
+from lakeback.travel.history import entity_history
 from lakeback.travel.reader import read_view
 
 
@@ -76,6 +78,19 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--table", required=True)
     diff.add_argument("--from", dest="from_at", required=True)
     diff.add_argument("--to", dest="to_at", required=True)
+
+    history = subparsers.add_parser(
+        "history", help="per-entity state intervals across a snapshot version range"
+    )
+    _add_output(history)
+    history.add_argument("--table", required=True)
+    history.add_argument("--from", dest="from_version", required=True)
+    history.add_argument("--to", dest="to_version", required=True)
+    history.add_argument("--key", default=None, help="primary key field override")
+    history.add_argument(
+        "--key-value", default=None,
+        help="only report this primary key; omit to list every entity in the range",
+    )
 
     audit = subparsers.add_parser("backfill-audit", help="audit two local backfill outputs")
     _add_output(audit)
@@ -148,6 +163,17 @@ def cmd_diff(config: Config, args) -> int:
     return 0
 
 
+def cmd_history(config: Config, args) -> int:
+    # Read-only ledger load: querying history must not create or rewrite files.
+    ledger = Ledger(config.ledger_dir, read_only=True)
+    result = entity_history(
+        config, ledger, args.table, args.from_version, args.to_version,
+        key_value=args.key_value, key=args.key,
+    )
+    _emit(args, result, render_history)
+    return 0
+
+
 def cmd_backfill_audit(config: Config, args) -> int:
     report = run_audit(
         config, args.table, args.before, args.after,
@@ -181,6 +207,7 @@ COMMANDS = {
     "snapshot": cmd_snapshot,
     "travel": cmd_travel,
     "diff": cmd_diff,
+    "history": cmd_history,
     "backfill-audit": cmd_backfill_audit,
     "serve": cmd_serve,
     "doctor": cmd_doctor,

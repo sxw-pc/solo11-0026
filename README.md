@@ -98,6 +98,17 @@ lakeback diff --table orders --from 1 --to 2
 lakeback diff --table orders --from 1 --to 2 --json
 ```
 
+单表实体历史（版本区间按版本号定义，`valid_from` 含、`valid_to` 不含）：
+
+```bash
+# 指定主键：只返回该实体在各版本中的存在状态与字段值
+lakeback history --table orders --from 1 --to 2 --key-value 100 --json
+# 省略主键值：批量返回区间内曾出现过的全部实体，按主键稳定排序
+lakeback history --table orders --from 1 --to 2 --json
+```
+
+`history` 复用 `travel` 的固定快照读取与 sha256 校验、以及账本中的实际版本列表；查询为只读，不追加版本、不重写索引或账本。区间状态分为 `present`（实体存在，`fields` 为字段值，字段值可为 `null`）、`absent`（整行缺失）和 `unverifiable`（该版本无法读取或校验，`status=incomplete`）。`present` 但字段为 `null` 与 `absent` 是不同状态；删除后内容相同的重建会保留为独立的 `present` 区间。相邻版本完全相同的状态、以及相邻的相同 `absent`/相同失败状态的区间才会压缩。读取任一版本遇到重复主键、数据文件缺失或 sha256 不符时，该版本进入 `unverifiable_versions`，不会把缺失快照当成实体已删除。
+
 回填审计（默认 fixture 会得到 `residual_diff`，所以退出码为 **4**）：
 
 ```bash
@@ -162,6 +173,19 @@ pytest -q
 
 `diff` 以 `lakeback.toml` 的 `[keys].<table>` 为主键（表必须有该键）。输出新增行、删除行和修改行的字段级 before/after；三种列表均按主键升序（数字键按数值排序），不依赖文件系统遍历顺序。字段变更顺序遵循 snapshot schema，确定可复现。
 
+### 实体历史语义
+
+`history --table T --from A --to B` 只消费账本中 `A..B` 的实际连续版本（含两端）；`latest` 可作上界。区间按版本号而非时间戳定义：`valid_from` 包含，`valid_to` 不包含，最后一段 `valid_to = B + 1`。因此同一秒创建的多个快照仍按版本号先后处理，不按 `created_at` 合并或重排。
+
+每个实体的状态：
+- `present`：实体行存在，`fields` 为该版本的字段值；字段值为 `null` 时 `fields[name] = null`，但状态仍是 `present`；
+- `absent`：整行不存在（包括从未出现或被删除）；
+- `unverifiable`：该版本无法读取/校验（重复主键、文件缺失、sha256 不符、主键列缺失等），`error` 给出结构化 `code/message/details`。
+
+压缩规则：只合并相邻且完全相同的状态。`present` 的比较基于整行字段值（含 `null`），所以 v1 与 v4 首尾字段相同、中间经过删除时，结果仍是 `present → absent → present` 三段；不同版本但字段值相同的连续 `present` 会合并为一段。相邻 `absent` 合并；相邻 `unverifiable` 因失败细节不同不会压缩。
+
+输出包含 `versions`（区间内每个版本的 `snapshot_id`、`created_at`、`readable`）和 `unverifiable_versions`；任一版本不可验证时顶层 `status = incomplete`，且该版本不会退化为 `absent`。`entities` 按主键升序稳定排序（数字键按数值），每个区间带 `source_version` 与 `source_snapshot`。同一输入不依赖目录遍历顺序；查询前后账本与快照文件不变。
+
 ## 4. 回填审计的判定规则与三类结论
 
 `backfill-audit` 比较两套目录并执行五项检查，报告中的 `checks` 会给出每项的判定依据：
@@ -202,6 +226,7 @@ lakeback/
 │   │   ├── ledger.py / manifest.py / snapshotter.py
 │   ├── travel/
 │   │   ├── resolver.py / reader.py / diff.py
+│   │   └── history.py / states.py
 │   ├── backfill/
 │   │   ├── auditor.py / report.py
 │   ├── service/
@@ -218,7 +243,7 @@ lakeback/
 └── tests/
     ├── conftest.py
     ├── test_config.py / test_backends.py / test_snapshot.py
-    ├── test_travel.py / test_diff.py / test_backfill_audit.py
+    ├── test_travel.py / test_diff.py / test_history.py / test_backfill_audit.py
     ├── test_service.py / test_cli.py / test_fixtures.py
 ```
 
@@ -271,9 +296,9 @@ pytest -q
 pytest --cov=lakeback --cov-report=term-missing
 ```
 
-测试全部使用 `tmp_path`，不访问网络、不写用户 home。覆盖范围包括：配置错误分支、两种后端、快照幂等、账本 hash 链/索引篡改检测、版本与时间边界、分区裁剪、diff 确定性、三种审计结论、HTTP 正常与 4xx/405、非法绑定、CLI 退出码 0/2/3/4、fixture 字节确定性。
+测试全部使用 `tmp_path`，不访问网络、不写用户 home。覆盖范围包括：配置错误分支、两种后端、快照幂等、账本 hash 链/索引篡改检测、版本与时间边界、分区裁剪、diff 确定性、实体历史的修改/删除/重建/同秒版本、NULL 与缺失区分、重复主键与缺失/损坏快照的结构化报告、只读性、三种审计结论、HTTP 正常与 4xx/405、非法绑定、CLI 退出码 0/2/3/4、fixture 字节确定性。
 
-最近一次本地统计（详见文末验证记录）：**97 passed**，`lakeback` 包行覆盖率 **84%**；测试 Python 物理行约 1292 行，占 Python 总物理行 4469 行的约 29%（要求 ≥25%）。
+最近一次本地统计（详见文末验证记录）：**111 passed, 1 skipped**（跳过项为未安装 pyarrow 时的 Parquet 对照用例）。
 
 ## 10. 已知边界与明确不实现
 
@@ -284,6 +309,7 @@ pytest --cov=lakeback --cov-report=term-missing
 - 本地账本使用进程内锁，只保证单进程追加；没有跨进程/多主机并发控制，也不提供 ACID 写事务。
 - 快照数据文件会完整复制，因此磁盘占用随快照数增长；没有压缩、去重存储或清理机制。
 - 时间旅行读取会把所选分区的命中行载入内存；fixture 规模为数千行，不面向大数据量。
+- 实体历史同样按版本逐段加载区间内的快照（每个版本读取一次），区间越大内存与 IO 越高；它不提供跨表查询，也不对不可验证版本做猜测性补全。
 - 一个表的物理文件必须有一致字段集合和一致的分区目录布局；否则拒绝快照/审计并报结构错误。
 - CSV 类型推断存在上述文本语义边界；Parquet 行为由 pyarrow schema 决定。
 - 审计没有“允许的预期变更”白名单，任何差异都会作为 residual 呈现。
@@ -294,7 +320,7 @@ pytest --cov=lakeback --cov-report=term-missing
 - 跨表血缘与谱系分析；
 - 流式摄入、CDC、消息队列；
 - 多用户鉴权、租户隔离、远程对象存储后端；
-- SQL 解析与任意查询下推（只支持按表/分区/版本的时间旅行读取与差异）；
+- SQL 解析与任意查询下推（只支持按表/分区/版本的时间旅行读取、差异与单实体历史）；
 - 写入 HTTP 接口、前端框架工程化；
 - 性能基准与大数据量压测。
 
@@ -321,8 +347,7 @@ pytest --cov=lakeback --cov-report=term-missing
 | 同目录自比 `backfill-audit` | 0 | `consistent`、`rpt-b5ef89f760bcbe09`；全部计数为 0 |
 | `lakeback travel --table orders --at 99` | 3 | 输出 `no snapshot version 99` 到 stderr |
 | `lakeback snapshot --table ../escape` | 2 | 参数校验拒绝并输出 `lakeback:` 错误 |
-| `pytest -q` | 0 | `97 passed` |
-| 无 pyarrow 屏蔽测试（CSV 降级） | 0 | `93 passed, 1 skipped`；仅 Parquet 对照用例跳过 |
+| `pytest -q`（新增实体历史回归后，CSV-only 环境） | 0 | `111 passed, 1 skipped`；仅 Parquet 对照用例跳过 |
 | `pytest -q --cov=lakeback --cov-report=term` | 0 | 1876 statements / 296 missed / 总覆盖率 84% |
 | 单文件/总量检查 | — | 最大 Python 文件 282 行（≤300）；Python 总计 4469 行（2500–4500） |
 

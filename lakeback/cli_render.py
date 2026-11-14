@@ -76,6 +76,41 @@ def render_diff(result: dict) -> str:
     return "\n".join(lines)
 
 
+def render_history(result: dict) -> str:
+    scope = "all entities" if result["key_value"] is None else f"key={result['key_value']}"
+    lines = [
+        f"history table={result['table']} key={result['key']} {scope}",
+        f"  versions {result['from_version']}..{result['to_version']} "
+        f"status={result['status']} entities={result['entity_count']}",
+    ]
+    for version in result["versions"]:
+        mark = "ok" if version["readable"] else "UNVERIFIABLE"
+        lines.append(
+            f"  v{version['version']} {version['snapshot_id']} "
+            f"{version['created_at']} {mark}"
+        )
+    shown = 0
+    for entity in result["entities"]:
+        for interval in entity["intervals"]:
+            shown += 1
+            if shown > 20:
+                continue
+            if interval["status"] == "present":
+                detail = json.dumps(interval["fields"], sort_keys=True)
+            elif interval["status"] == "absent":
+                detail = "row absent"
+            else:
+                detail = f"unverifiable: {interval['error']['message']}"
+            lines.append(
+                f"  key={entity['key']} [{interval['valid_from']},"
+                f"{interval['valid_to']}) {interval['status']} {detail}"
+            )
+    total = sum(len(entity["intervals"]) for entity in result["entities"])
+    if total > 20:
+        lines.append(f"  ... {total - 20} more intervals; use --json for all")
+    return "\n".join(lines)
+
+
 def render_audit(report: dict) -> str:
     counts = report["counts"]
     lines = [

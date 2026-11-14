@@ -19,18 +19,22 @@ INDEX_FILE = "index.json"
 class Ledger:
     """A small, local, tamper-evident history of immutable snapshots."""
 
-    def __init__(self, ledger_dir: Path) -> None:
+    def __init__(self, ledger_dir: Path, *, read_only: bool = False) -> None:
         self.directory = Path(ledger_dir).resolve()
         self.ledger_path = self.directory / LEDGER_FILE
         self.index_path = self.directory / INDEX_FILE
+        self.read_only = read_only
         self._lock = threading.Lock()
         self._records: list[dict] = []
         self._by_table: dict[str, list[dict]] = {}
         self._by_id: dict[str, dict] = {}
-        try:
-            self.directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise LedgerError(f"cannot create ledger directory {self.directory}: {exc}") from exc
+        if not read_only:
+            try:
+                self.directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise LedgerError(
+                    f"cannot create ledger directory {self.directory}: {exc}"
+                ) from exc
         self._load()
         expected = self._build_index()
         if self.index_path.exists():
@@ -40,7 +44,7 @@ class Ledger:
                     "snapshot index is inconsistent with the append-only ledger",
                     details={"path": str(self.index_path)},
                 )
-        else:
+        elif not read_only:
             self._write_index(expected)
 
     def _load(self) -> None:
@@ -141,6 +145,8 @@ class Ledger:
 
     def append(self, manifest: dict) -> dict:
         """Append a new content manifest, or return the existing idempotent record."""
+        if self.read_only:
+            raise LedgerError("ledger was opened read-only; cannot append snapshots")
         if not isinstance(manifest, dict):
             raise LedgerError("snapshot manifest must be an object")
         snapshot_id = manifest.get("snapshot_id")
@@ -206,6 +212,6 @@ class Ledger:
 
     def verify(self) -> None:
         """Re-read from disk and compare; useful for diagnostics."""
-        fresh = type(self)(self.directory)
+        fresh = type(self)(self.directory, read_only=self.read_only)
         if fresh.index_view() != self.index_view():  # pragma: no cover - defensive
             raise LedgerError("ledger changed while verifying")
