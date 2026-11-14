@@ -97,6 +97,40 @@ def render_audit(report: dict) -> str:
     return "\n".join(lines)
 
 
+def render_referential(result: dict) -> str:
+    counts = result["counts"]
+    lines = [
+        f"referential audit status={result['status']} null_policy={result['null_policy']}",
+        f"  fact      {result['fact']['table']} v{result['fact']['version']} "
+        f"{result['fact']['snapshot_id']}",
+        f"  dimension {result['dimension']['table']} v{result['dimension']['version']} "
+        f"{result['dimension']['snapshot_id']}",
+        "  key: " + ", ".join(
+            f"{pair['fact_column']}={pair['dimension_column']} "
+            f"({pair['compare_type']}: {pair['fact_type']}/{pair['dimension_type']})"
+            for pair in result["foreign_key"]
+        ),
+        f"  rows={counts['fact_rows']} checked={counts['checked']} "
+        f"matched={counts['matched']} orphans={counts['orphans']} "
+        f"null_skipped={counts['null_skipped']}",
+        f"  parent-key duplicates: {counts['parent_key_duplicates']} key(s) / "
+        f"{counts['parent_key_duplicate_rows']} row(s); "
+        f"ambiguous fact matches={counts['ambiguous_parent_matches']}",
+    ]
+    for item in result["orphans"][:5]:
+        lines.append(f"  ! row {item['row_index']} " + json.dumps(
+            item["foreign_key"], sort_keys=True, ensure_ascii=False
+        ))
+    if counts["orphans"] > 5:
+        lines.append(f"  ... {counts['orphans'] - 5} more orphans; use --json for all")
+    for item in result["parent_key_duplicates"][:5]:
+        lines.append(
+            f"  x duplicate parent key {json.dumps(item['key'], sort_keys=True)} "
+            f"rows={item['row_count']}"
+        )
+    return "\n".join(lines)
+
+
 def render_doctor(result: dict) -> str:
     lines = [
         f"LakeBack environment check ({result['version']})",

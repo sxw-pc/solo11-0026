@@ -13,17 +13,19 @@ from lakeback.cli_render import (
     render_audit,
     render_diff,
     render_generated,
+    render_referential,
     render_snapshot,
     render_travel,
 )
 from lakeback.config import Config
-from lakeback.errors import LakeBackError, RequestError
+from lakeback.errors import EXIT_RESIDUAL, LakeBackError, RequestError
 from lakeback.fixtures.generate import generate_fixtures
 from lakeback.service.app import make_server
 from lakeback.snapshot.ledger import Ledger
 from lakeback.snapshot.snapshotter import create_snapshot
 from lakeback.travel.diff import diff_versions
 from lakeback.travel.reader import read_view
+from lakeback.travel.referential import audit_referential_integrity
 
 
 def _add_output(parser: argparse.ArgumentParser) -> None:
@@ -84,6 +86,29 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--after", required=True)
     audit.add_argument("--key", default=None)
     _backend_arg(audit)
+
+    referential = subparsers.add_parser(
+        "referential-audit",
+        help="audit foreign keys of a fact snapshot against a dimension snapshot",
+    )
+    _add_output(referential)
+    referential.add_argument("--fact-table", required=True)
+    referential.add_argument("--fact-version", required=True)
+    referential.add_argument("--dimension-table", required=True)
+    referential.add_argument("--dimension-version", required=True)
+    referential.add_argument(
+        "--key",
+        action="append",
+        required=True,
+        metavar="FACT_COL=DIMENSION_COL",
+        help="foreign-key column pair; repeat for a composite key (order is preserved)",
+    )
+    referential.add_argument(
+        "--null-policy",
+        choices=["skip", "error"],
+        default="skip",
+        help="skip rows whose foreign key has a NULL component, or fail (default: skip)",
+    )
 
     serve = subparsers.add_parser("serve", help="run the read-only loopback HTTP service")
     serve.add_argument("--host", default=None)
@@ -163,6 +188,46 @@ def cmd_backfill_audit(config: Config, args) -> int:
     return 0
 
 
+def _parse_foreign_key(raw: list[str]) -> dict[str, str]:
+    """Parse repeated ``fact_col=dimension_col`` pairs, preserving order."""
+    pairs: dict[str, str] = {}
+    for item in raw:
+        fact_column, separator, dimension_column = item.partition("=")
+        fact_column = fact_column.strip()
+        dimension_column = dimension_column.strip()
+        if not separator or not fact_column or not dimension_column:
+            raise RequestError(
+                f"invalid foreign-key pair {item!r} (expected FACT_COL=DIMENSION_COL)"
+            )
+        if fact_column in pairs:
+            raise RequestError(f"duplicate foreign key column: {fact_column!r}")
+        pairs[fact_column] = dimension_column
+    return pairs
+
+
+def cmd_referential_audit(config: Config, args) -> int:
+    result = audit_referential_integrity(
+        config,
+        Ledger(config.ledger_dir),
+        args.fact_table,
+        args.fact_version,
+        args.dimension_table,
+        args.dimension_version,
+        _parse_foreign_key(args.key),
+        null_policy=args.null_policy,
+    )
+    _emit(args, result, render_referential)
+    if result["status"] != "consistent":
+        print(
+            f"lakeback: referential audit status={result['status']} "
+            f"orphans={result['counts']['orphans']} "
+            f"parent_key_duplicates={result['counts']['parent_key_duplicates']}",
+            file=sys.stderr,
+        )
+        return EXIT_RESIDUAL
+    return 0
+
+
 def cmd_serve(config: Config, args) -> int:
     server = make_server(config, host=args.host, port=args.port)
     host, port = server.server_address[:2]
@@ -182,6 +247,7 @@ COMMANDS = {
     "travel": cmd_travel,
     "diff": cmd_diff,
     "backfill-audit": cmd_backfill_audit,
+    "referential-audit": cmd_referential_audit,
     "serve": cmd_serve,
     "doctor": cmd_doctor,
     "selftest": cmd_selftest,

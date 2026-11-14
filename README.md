@@ -98,6 +98,22 @@ lakeback diff --table orders --from 1 --to 2
 lakeback diff --table orders --from 1 --to 2 --json
 ```
 
+跨表参照完整性审计（分别固定事实表与维表的快照版本，逐行核对外键）：
+
+```bash
+lakeback referential-audit \
+  --fact-table orders --fact-version 1 \
+  --dimension-table users --dimension-version 1 \
+  --key user_id=user_id
+
+# 联合外键：重复 --key，顺序即元组顺序
+lakeback referential-audit \
+  --fact-table orders --fact-version 1 \
+  --dimension-table users --dimension-version 1 \
+  --key user_id=user_id --key region=region \
+  --null-policy skip --json
+```
+
 回填审计（默认 fixture 会得到 `residual_diff`，所以退出码为 **4**）：
 
 ```bash
@@ -162,6 +178,19 @@ pytest -q
 
 `diff` 以 `lakeback.toml` 的 `[keys].<table>` 为主键（表必须有该键）。输出新增行、删除行和修改行的字段级 before/after；三种列表均按主键升序（数字键按数值排序），不依赖文件系统遍历顺序。字段变更顺序遵循 snapshot schema，确定可复现。
 
+### 跨表参照完整性语义
+
+`referential-audit` 独立于 `compute_diff`：调用方分别用 `--fact-version` 与 `--dimension-version` 固定两张表各自的版本，逐行核对事实表外键能否在维表同一版本中找到父行。
+
+- **版本必须显式**：只接受正整数或 `vN`；`latest`、ISO 时间戳与空值都会被拒绝（退出码 2），不会回退到当前湖表或最新快照。
+- **先固定再读取**：两个 manifest 都先解析并固定，之后才读取任一快照；读取后重新核对每个快照文件的 sha256，并从磁盘重读账本，证明两个已固定版本之前的历史未被改写。对固定版本之后追加的新版本不影响判定。
+- **联合键按类型元组比较**：`--key fact_col=dim_col` 可重复，顺序即联合键顺序。每个分量用各自快照 schema 归一后保留为独立元组元素，绝不拼接字符串，因此 `("x","yz")` 与 `("xy","z")` 不会碰撞。int/float 互比时各自保留本侧类型，避免大整数被 float 舍入而产生假匹配。
+- **缺失列或类型不兼容明确拒绝**：外键列在任一侧 schema 中缺失，或两侧类型既不相同也非 int/float 数值域时，直接报错（`data_error`），既不记为孤儿也不记为匹配。
+- **NULL 策略显式**：`--null-policy skip`（默认）跳过外键任一分量为 NULL 的行并计入 `null_skipped`；`--null-policy error` 遇到此类行即报错。维表中键分量为 NULL 的行不参与匹配。
+- **父键重复单独报告**：同一固定版本内父键重复时，不静默取一条、也不退化为多对一；该键列入 `parent_key_duplicates`（含证据行与行号），相应事实行计入 `ambiguous_parent_matches` 并单列明细，与真实 `orphans` 分开。
+- **结果可复核**：`counts` 给出 `fact_rows / checked / matched / ambiguous_parent_matches / orphans / null_skipped` 等计数，`checks` 给出行数守恒、参照完整性与父键唯一性三项判定，`verified` 记录快照文件 sha256 核验数量、账本记录数与固定版本的历史摘要。
+- 结论 `status` 为 `consistent`、`orphan_references`、`duplicate_parent_keys` 或 `orphan_references_and_duplicate_parent_keys`；非 `consistent` 时退出码 4（与 backfill-audit 的 CI 卡点一致），版本不存在为 3，参数/数据错误为 2。
+
 ## 4. 回填审计的判定规则与三类结论
 
 `backfill-audit` 比较两套目录并执行五项检查，报告中的 `checks` 会给出每项的判定依据：
@@ -201,7 +230,7 @@ lakeback/
 │   ├── snapshot/
 │   │   ├── ledger.py / manifest.py / snapshotter.py
 │   ├── travel/
-│   │   ├── resolver.py / reader.py / diff.py
+│   │   ├── resolver.py / reader.py / diff.py / referential.py
 │   ├── backfill/
 │   │   ├── auditor.py / report.py
 │   ├── service/
@@ -218,7 +247,7 @@ lakeback/
 └── tests/
     ├── conftest.py
     ├── test_config.py / test_backends.py / test_snapshot.py
-    ├── test_travel.py / test_diff.py / test_backfill_audit.py
+    ├── test_travel.py / test_diff.py / test_referential.py / test_backfill_audit.py
     ├── test_service.py / test_cli.py / test_fixtures.py
 ```
 
