@@ -12,6 +12,7 @@ from lakeback.cli_diagnostics import cmd_doctor, cmd_selftest
 from lakeback.cli_render import (
     render_audit,
     render_diff,
+    render_file_diff,
     render_generated,
     render_snapshot,
     render_travel,
@@ -23,6 +24,7 @@ from lakeback.service.app import make_server
 from lakeback.snapshot.ledger import Ledger
 from lakeback.snapshot.snapshotter import create_snapshot
 from lakeback.travel.diff import diff_versions
+from lakeback.travel.file_diff import file_diff_versions
 from lakeback.travel.reader import read_view
 
 
@@ -76,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--table", required=True)
     diff.add_argument("--from", dest="from_at", required=True)
     diff.add_argument("--to", dest="to_at", required=True)
+
+    file_diff = subparsers.add_parser(
+        "file-diff", help="compare two snapshots at the manifest file level"
+    )
+    _add_output(file_diff)
+    file_diff.add_argument("--table", required=True)
+    file_diff.add_argument("--from", dest="from_at", required=True)
+    file_diff.add_argument("--to", dest="to_at", required=True)
 
     audit = subparsers.add_parser("backfill-audit", help="audit two local backfill outputs")
     _add_output(audit)
@@ -148,6 +158,14 @@ def cmd_diff(config: Config, args) -> int:
     return 0
 
 
+def cmd_file_diff(config: Config, args) -> int:
+    result = file_diff_versions(
+        Ledger(config.ledger_dir), args.table, args.from_at, args.to_at
+    )
+    _emit(args, result, render_file_diff)
+    return 0
+
+
 def cmd_backfill_audit(config: Config, args) -> int:
     report = run_audit(
         config, args.table, args.before, args.after,
@@ -181,6 +199,7 @@ COMMANDS = {
     "snapshot": cmd_snapshot,
     "travel": cmd_travel,
     "diff": cmd_diff,
+    "file-diff": cmd_file_diff,
     "backfill-audit": cmd_backfill_audit,
     "serve": cmd_serve,
     "doctor": cmd_doctor,

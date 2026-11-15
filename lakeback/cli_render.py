@@ -76,6 +76,45 @@ def render_diff(result: dict) -> str:
     return "\n".join(lines)
 
 
+def render_file_diff(result: dict) -> str:
+    counts = result["counts"]
+    bytes_ = result["bytes"]
+    attribution = result["partition_attribution"]
+    reuse = result["reuse"]
+    lines = [
+        f"file-diff table={result['table']}",
+        f"  from v{result['from']['version']} {result['from']['snapshot_id']}",
+        f"  to   v{result['to']['version']} {result['to']['snapshot_id']}",
+        f"  files added/deleted/rewritten/unchanged: "
+        f"{counts['added']}/{counts['deleted']}/{counts['rewritten']}/{counts['unchanged']}",
+        f"  bytes added={bytes_['added']} deleted={bytes_['deleted']} "
+        f"rewritten(old->new)={bytes_['rewritten_old']}->{bytes_['rewritten_new']} "
+        f"unchanged={bytes_['unchanged']}",
+        f"  partition attribution: {attribution['status']}",
+        f"  reuse: reusable_bytes={reuse['reusable_bytes']} "
+        f"non_reusable_bytes={reuse['non_reusable_bytes']}",
+    ]
+    for bucket in result["partitions"]:
+        part = json.dumps(bucket["partition"], sort_keys=True)
+        c = bucket["counts"]
+        lines.append(
+            f"  partition {part}: "
+            f"+{c['added']} -{c['deleted']} ~{c['rewritten']} ={c['unchanged']}"
+        )
+    for item in result["files"]["rewritten"][:10]:
+        status = item["reuse"]["status"]
+        lines.append(
+            f"  ~ {item['path']} {item['from']['sha256'][:12]} -> "
+            f"{item['to']['sha256'][:12]} reuse={status}"
+        )
+    if attribution["unattributable"]:
+        lines.append("  unattributable; use --json for structured detail")
+    total_rewrites = len(result["files"]["rewritten"])
+    if total_rewrites > 10:
+        lines.append(f"  ... {total_rewrites - 10} more rewrites; use --json for detail")
+    return "\n".join(lines)
+
+
 def render_audit(report: dict) -> str:
     counts = report["counts"]
     lines = [

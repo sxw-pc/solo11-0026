@@ -98,6 +98,13 @@ lakeback diff --table orders --from 1 --to 2
 lakeback diff --table orders --from 1 --to 2 --json
 ```
 
+文件层面的快照差异（只读 manifest，不读数据行；原地重写不会被拆成删除+新增）：
+
+```bash
+lakeback file-diff --table orders --from 1 --to 2
+lakeback file-diff --table orders --from 1 --to 2 --json
+```
+
 回填审计（默认 fixture 会得到 `residual_diff`，所以退出码为 **4**）：
 
 ```bash
@@ -162,6 +169,19 @@ pytest -q
 
 `diff` 以 `lakeback.toml` 的 `[keys].<table>` 为主键（表必须有该键）。输出新增行、删除行和修改行的字段级 before/after；三种列表均按主键升序（数字键按数值排序），不依赖文件系统遍历顺序。字段变更顺序遵循 snapshot schema，确定可复现。
 
+#### `file-diff` 的文件归因与复用统计
+
+`file-diff` 只依赖两个快照 manifest 中的文件条目（相对路径、分区标注、字节数、sha256），不要求配置主键、也不读取数据行。归因规则以**相对路径和 sha256 联合判定**：
+
+- 路径与 sha256 都未变 → `unchanged`（未变）；
+- 路径只在旧快照存在 → `deleted`（删除）；
+- 路径只在新快照存在 → `added`（新增）；
+- 同一路径但 sha256 变了 → `rewritten`（原地重写）。重写始终是单条记录，不会被记成删除加新增。
+
+每个重写文件还会用其**旧内容 sha256** 在新快照中查找复用机会：旧字节出现在同一分区的另一个相对路径上时记为 `reusable` 并按旧文件大小累加 `reusable_bytes`；只出现在分区标注不同的路径上记为 `partition_mismatch`，新快照中完全找不到记为 `content_absent`，两者的字节数在 `reuse.reasons` 中分别汇总并给出不可复用原因。
+
+输出按分区汇总四类（新增/删除/重写/未变）的文件数与字节数，重写同时给 `rewritten_old`/`rewritten_new` 两列字节；分区汇总相加恒等于文件级清单的顶层 `counts`/`bytes`，且 `deleted + rewritten_old + unchanged` 等于旧快照总字节、`added + rewritten_new + unchanged` 等于新快照总字节。同一快照自比（如 `--from 2 --to 2`）得到零变更、全部文件记为未变。两个快照的分区列不一致时命令不会失败：`partition_attribution.status` 置为 `inconsistent`，不产出分区汇总，并在 `unattributable` 中结构化给出双方分区列与各自独有列，文件级归因、字节对账与复用分析仍然完整。
+
 ## 4. 回填审计的判定规则与三类结论
 
 `backfill-audit` 比较两套目录并执行五项检查，报告中的 `checks` 会给出每项的判定依据：
@@ -201,7 +221,7 @@ lakeback/
 │   ├── snapshot/
 │   │   ├── ledger.py / manifest.py / snapshotter.py
 │   ├── travel/
-│   │   ├── resolver.py / reader.py / diff.py
+│   │   ├── resolver.py / reader.py / diff.py / file_diff.py
 │   ├── backfill/
 │   │   ├── auditor.py / report.py
 │   ├── service/
@@ -218,7 +238,7 @@ lakeback/
 └── tests/
     ├── conftest.py
     ├── test_config.py / test_backends.py / test_snapshot.py
-    ├── test_travel.py / test_diff.py / test_backfill_audit.py
+    ├── test_travel.py / test_diff.py / test_file_diff.py / test_backfill_audit.py
     ├── test_service.py / test_cli.py / test_fixtures.py
 ```
 
