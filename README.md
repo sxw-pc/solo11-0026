@@ -117,6 +117,30 @@ lakeback backfill-audit \
   --after data/fixtures/after/orders
 ```
 
+### 预期变更声明（可选）
+
+回填方案中已申报的字段变化可以通过 `--expectations PATH`（等价别名 `--expected-changes`）传入声明文件；文件支持 TOML 或 JSON，声明按**表 + 主键 + 字段**限定允许的变化方向：
+
+```toml
+# changes.toml
+[[changes]]
+table = "orders"
+key = 100464
+field = "user_id"
+direction = "increase"   # any / increase / decrease
+```
+
+```json
+{
+  "changes": [
+    {"table": "orders", "key": 100464,
+     "field": "user_id", "direction": "increase"}
+  ]
+}
+```
+
+同一条目的字段也可写成 `fields = { user_id = "increase", amount = "any" }`。命中声明的差异归入 `expected_changes`（附逐行字段明细与计数），未命中的仍留在 `residual`，三种 `status` 与退出码语义不变。若某分区的校验和不一致字段里只有一部分被声明，其余字段仍算 residual：`partition_checksum_mismatches` 的每个分区会同时列出 `expected_fields` 与 `residual_fields`。`report_id` 指纹包含声明内容，同一对输入配不同声明会得到不同指纹，同一份声明重复执行则指纹稳定。
+
 启动只读 HTTP 服务，默认 `127.0.0.1:5000`。以下两种方式等价：
 
 ```bash
@@ -175,10 +199,10 @@ pytest -q
 判定优先级与三类结论：
 
 - `structural_mismatch`：schema 或分区结构不一致（优先级最高）；
-- `residual_diff`：结构一致，但行数、主键集合或分区字段校验和存在残留差异；
-- `consistent`：全部检查通过。
+- `residual_diff`：结构一致，但行数、主键集合或分区字段校验和仍有未被声明的残留差异；
+- `consistent`：扣除已声明的预期变更后，全部检查通过。
 
-报告同时包含 `counts`、缺失/多出主键、修改行的字段级明细、分区校验和摘要、缺失/多出分区，以及 `checks[].evidence`。JSON 报告写入 `data/reports/<report_id>.json`，Markdown 摘要写入同名 `.md`；`report_id` 由两端内容指纹决定，可稳定对应同一次审计。审计没有“预期变更白名单”：任何差异都会体现为 residual，必须由调用方另行确认。
+报告同时包含 `counts`、缺失/多出主键、修改行的字段级明细、分区校验和摘要、缺失/多出分区，以及 `checks[].evidence`。未提供声明时行为与之前完全一致：任何差异都会体现为 residual。提供 `--expectations` 后，命中声明的字段变化移入 `expected_changes`（含声明摘要、逐行明细与计数），`residual` 只保留未命中部分；`counts.expected_fields`、`counts.residual_modified_rows` 给出两侧计数。`partition_checksum_mismatches` 中每个分区同时给出 `mismatched_fields`、`expected_fields`、`residual_fields`，只有 `residual_fields` 会令该检查失败。声明不会豁免主键缺失/多出、行数差异或分区结构差异。JSON 报告写入 `data/reports/<report_id>.json`，Markdown 摘要写入同名 `.md`；`report_id` 由两端内容指纹与声明内容共同决定，可稳定对应同一次审计，声明不同则指纹不同。
 
 CLI 退出码：`consistent` 为 0；`residual_diff` 与 `structural_mismatch` 均为 4，方便 CI 卡点；参数/配置错误为 2；数据缺失或版本不存在为 3。
 
@@ -203,7 +227,8 @@ lakeback/
 │   ├── travel/
 │   │   ├── resolver.py / reader.py / diff.py
 │   ├── backfill/
-│   │   ├── auditor.py / report.py
+│   │   ├── auditor.py / compare.py / report.py
+│   │   ├── declaration.py / expectations.py
 │   ├── service/
 │   │   ├── app.py / routes.py
 │   │   └── static/index.html
@@ -271,9 +296,9 @@ pytest -q
 pytest --cov=lakeback --cov-report=term-missing
 ```
 
-测试全部使用 `tmp_path`，不访问网络、不写用户 home。覆盖范围包括：配置错误分支、两种后端、快照幂等、账本 hash 链/索引篡改检测、版本与时间边界、分区裁剪、diff 确定性、三种审计结论、HTTP 正常与 4xx/405、非法绑定、CLI 退出码 0/2/3/4、fixture 字节确定性。
+测试全部使用 `tmp_path`，不访问网络、不写用户 home。覆盖范围包括：配置错误分支、两种后端、快照幂等、账本 hash 链/索引篡改检测、版本与时间边界、分区裁剪、diff 确定性、三种审计结论、预期变更声明的解析/匹配/分区拆分与 `report_id` 指纹、HTTP 正常与 4xx/405、非法绑定、CLI 退出码 0/2/3/4、fixture 字节确定性。
 
-最近一次本地统计（详见文末验证记录）：**97 passed**，`lakeback` 包行覆盖率 **84%**；测试 Python 物理行约 1292 行，占 Python 总物理行 4469 行的约 29%（要求 ≥25%）。
+最近一次本地统计（详见文末验证记录）：**113 passed**（另有 1 个 pyarrow 用例在无 pyarrow 环境跳过），`lakeback` 包行覆盖率 **83%**；测试 Python 物理行约 1669 行，占 Python 总物理行 5525 行的约 30%（要求 ≥25%）。
 
 ## 10. 已知边界与明确不实现
 
@@ -286,7 +311,7 @@ pytest --cov=lakeback --cov-report=term-missing
 - 时间旅行读取会把所选分区的命中行载入内存；fixture 规模为数千行，不面向大数据量。
 - 一个表的物理文件必须有一致字段集合和一致的分区目录布局；否则拒绝快照/审计并报结构错误。
 - CSV 类型推断存在上述文本语义边界；Parquet 行为由 pyarrow schema 决定。
-- 审计没有“允许的预期变更”白名单，任何差异都会作为 residual 呈现。
+- 审计声明只豁免**字段值变化**；主键缺失/多出、行数差异和分区结构差异始终是 residual 或 structural，不会被声明掩盖。
 
 明确不实现：
 
@@ -321,9 +346,9 @@ pytest --cov=lakeback --cov-report=term-missing
 | 同目录自比 `backfill-audit` | 0 | `consistent`、`rpt-b5ef89f760bcbe09`；全部计数为 0 |
 | `lakeback travel --table orders --at 99` | 3 | 输出 `no snapshot version 99` 到 stderr |
 | `lakeback snapshot --table ../escape` | 2 | 参数校验拒绝并输出 `lakeback:` 错误 |
-| `pytest -q` | 0 | `97 passed` |
-| 无 pyarrow 屏蔽测试（CSV 降级） | 0 | `93 passed, 1 skipped`；仅 Parquet 对照用例跳过 |
-| `pytest -q --cov=lakeback --cov-report=term` | 0 | 1876 statements / 296 missed / 总覆盖率 84% |
-| 单文件/总量检查 | — | 最大 Python 文件 282 行（≤300）；Python 总计 4469 行（2500–4500） |
+| `pytest -q` | 0 | `113 passed, 1 skipped` |
+| 无 pyarrow 屏蔽测试（CSV 降级） | 0 | `113 passed, 1 skipped`；仅 Parquet 对照用例跳过 |
+| `pytest -q --cov=lakeback --cov-report=term` | 0 | 2201 statements / 372 missed / 总覆盖率 83% |
+| 单文件/总量检查 | — | 最大 Python 文件 282 行（≤300）；Python 总计 5525 行 |
 
 HTTP 验证：以无参数 `python -m lakeback` 在 `127.0.0.1:5000` 启动；`/`、`/api/tables`、`/api/travel`、`/api/diff`、`/api/backfill/report` 均返回 200（例如报告接口返回 `rpt-dc6d2003fd3baf5a` 的 8273 字节 JSON）；未知版本返回结构化 404；`../../etc/passwd` 形式 `report_id` 返回结构化 400；POST 返回 405；`0.0.0.0` 等非 loopback 绑定由配置层和服务层拒绝。

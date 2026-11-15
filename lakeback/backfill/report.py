@@ -54,12 +54,19 @@ def render_markdown(report: dict) -> str:
         f"- extra in after: {counts['extra_in_after']}",
         f"- modified rows: {counts['modified_rows']}",
         f"- unchanged rows: {counts['unchanged_rows']}",
+        f"- expected fields: {counts.get('expected_fields', 0)}",
+        f"- residual modified rows: {counts.get('residual_modified_rows', 0)}",
         "",
         "## Residual Detail",
         "",
     ])
     residual = report["residual"]
-    if not residual["missing_in_after"] and not residual["extra_in_after"] and not residual["modified_rows"]:
+    empty = (
+        not residual["missing_in_after"]
+        and not residual["extra_in_after"]
+        and not residual["modified_rows"]
+    )
+    if empty:
         lines.append("No row-level residual differences.")
     else:
         if residual["missing_in_after"]:
@@ -81,6 +88,29 @@ def render_markdown(report: dict) -> str:
         )
         if omitted > 0:
             lines.append(f"- ... {omitted} more row details are in the JSON report")
+    expected = report.get("expected_changes")
+    if expected:
+        declaration = expected["declaration"]
+        lines.extend([
+            "",
+            "## Expected Changes",
+            "",
+            f"- declaration: `{declaration['path'] or '<inline>'}`",
+            f"- declaration digest: `{declaration['digest']}`",
+            f"- declared rules: {declaration['rules']} "
+            f"(table: {declaration['table_rules']})",
+            f"- expected modified rows: {expected['counts']['modified_rows']}",
+            f"- expected fields (row-level / partition-level): "
+            f"{expected['counts']['fields']} / {expected['counts']['partition_fields']}",
+        ])
+        for item in expected["modified_rows"][:20]:
+            fields = ", ".join(change["name"] for change in item["fields"])
+            lines.append(f"- Expected key `{item['key']}` fields: {fields}")
+        for item in expected["partition_fields"][:20]:
+            lines.append(
+                f"- Expected partition `{_short(item['partition'])}`: fields "
+                + ", ".join(item["expected_fields"])
+            )
     if report["partition_checksum_mismatches"]:
         lines.extend(["", "## Partition Checksum Mismatches", ""])
         for item in report["partition_checksum_mismatches"]:
@@ -88,12 +118,26 @@ def render_markdown(report: dict) -> str:
                 f"- `{_short(item['partition'])}`: fields "
                 + ", ".join(item["mismatched_fields"])
             )
+            if item.get("expected_fields"):
+                lines.append(
+                    "  - expected: " + ", ".join(item["expected_fields"])
+                )
+            if item.get("residual_fields"):
+                lines.append(
+                    "  - residual: " + ", ".join(item["residual_fields"])
+                )
     lines.extend([
         "",
         "## Reproduction",
         "",
         f"`lakeback backfill-audit --table {report['table']} "
-        f"--before {report['before_root']} --after {report['after_root']} --json`",
+        f"--before {report['before_root']} --after {report['after_root']}"
+        + (
+            f" --expectations {report['expected_changes']['declaration']['path']}"
+            if report.get("expected_changes")
+            and report["expected_changes"]["declaration"]["path"] else ""
+        )
+        + " --json`",
         "",
     ])
     return "\n".join(lines)

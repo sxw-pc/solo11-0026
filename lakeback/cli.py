@@ -83,6 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--before", required=True)
     audit.add_argument("--after", required=True)
     audit.add_argument("--key", default=None)
+    audit.add_argument(
+        "--expectations",
+        "--expected-changes",
+        dest="expectations",
+        default=None,
+        metavar="PATH",
+        help="TOML/JSON declaration of expected field changes",
+    )
     _backend_arg(audit)
 
     serve = subparsers.add_parser("serve", help="run the read-only loopback HTTP service")
@@ -152,6 +160,7 @@ def cmd_backfill_audit(config: Config, args) -> int:
     report = run_audit(
         config, args.table, args.before, args.after,
         key=args.key, backend_name=args.backend,
+        expected_changes=args.expectations,
     )
     _emit(args, report, render_audit)
     if report["status"] != "consistent":

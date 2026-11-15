@@ -88,8 +88,14 @@ def render_audit(report: dict) -> str:
         f"keys {counts['before_keys']} -> {counts['after_keys']}",
         f"  missing/extra/modified: {counts['missing_in_after']}/"
         f"{counts['extra_in_after']}/{counts['modified_rows']}",
-        "  checks:",
     ]
+    if report.get("expected_changes"):
+        expected = report["expected_changes"]["counts"]
+        lines.append(
+            f"  expected fields: {expected['fields']} "
+            f"(partitions: {expected['partition_fields']})"
+        )
+    lines.append("  checks:")
     for check in report["checks"]:
         lines.append(f"    {check['name']}: {check['status']}")
     lines.append(f"  json report: {report['artifacts']['json_report']}")

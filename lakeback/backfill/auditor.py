@@ -5,160 +5,63 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from lakeback._util import (
-    NAME_RE,
-    canonical_json,
-    ensure_unique,
-    primary_key_sort,
-    sha256_text,
-    stable_rows,
+from lakeback._util import NAME_RE
+from lakeback.backfill.compare import (
+    checksum_evidence,
+    compare_keys,
+    fingerprint,
+    partition_evidence,
+    partition_payload,
+    schema_evidence,
 )
+from lakeback.backfill.expectations import ExpectedChanges, load_expected_changes
 from lakeback.backfill.report import write_audit_report
 from lakeback.config import Config
 from lakeback.errors import ConfigError, DataError, NotFoundError
-from lakeback.snapshot.manifest import schema_as_list
-from lakeback.tables import TableData, read_table_data
+from lakeback.tables import read_table_data
+
+SUMMARY = {
+    "consistent": "all structural, count, key and checksum checks passed",
+    "residual_diff": "structure matches but row or checksum differences remain",
+    "structural_mismatch": "schema or partition structure differs",
+}
 
 
 def _check(name: str, passed: bool, evidence: dict) -> dict:
     return {"name": name, "status": "pass" if passed else "fail", "evidence": evidence}
 
 
-def _partition_payload(marker: tuple) -> dict:
-    return dict(marker)
+def _resolve_roots(
+    before_root: Path | str, after_root: Path | str
+) -> tuple[Path, Path]:
+    before_path = Path(before_root).resolve()
+    after_path = Path(after_root).resolve()
+    if not before_path.is_dir():
+        raise NotFoundError(f"before table directory does not exist: {before_path}")
+    if not after_path.is_dir():
+        raise NotFoundError(f"after table directory does not exist: {after_path}")
+    return before_path, after_path
 
 
-def _schema_evidence(before: dict, after: dict) -> tuple[bool, dict]:
-    differences = {
-        "missing_fields": sorted(set(before) - set(after)),
-        "extra_fields": sorted(set(after) - set(before)),
-        "type_changes": {
-            name: {"before": before[name], "after": after[name]}
-            for name in sorted(set(before) & set(after))
-            if before[name] != after[name]
-        },
-        "order_changed": list(before) != list(after),
-    }
-    passed = not any([
-        differences["missing_fields"], differences["extra_fields"],
-        differences["type_changes"], differences["order_changed"],
-    ])
-    return passed, {
-        "before_schema": schema_as_list(before),
-        "after_schema": schema_as_list(after),
-        "differences": differences,
-    }
-
-
-def _partition_evidence(before: TableData, after: TableData) -> tuple[bool, dict, list, list]:
-    before_set = set(before.rows_by_partition)
-    after_set = set(after.rows_by_partition)
-    missing = sorted(before_set - after_set)
-    extra = sorted(after_set - before_set)
-    passed = before.partition_columns == after.partition_columns and not missing and not extra
-    evidence = {
-        "before_columns": before.partition_columns,
-        "after_columns": after.partition_columns,
-        "before_partitions": [_partition_payload(item) for item in sorted(before_set)],
-        "after_partitions": [_partition_payload(item) for item in sorted(after_set)],
-        "missing_in_after": [_partition_payload(item) for item in missing],
-        "extra_in_after": [_partition_payload(item) for item in extra],
-    }
-    return passed, evidence, missing, extra
-
-
-def _keyed(rows: list[dict], key: str) -> dict[str, dict]:
-    try:
-        ensure_unique(rows, key)
-    except ValueError as exc:
-        raise DataError(str(exc)) from exc
-    return {canonical_json(row[key]): row for row in rows}
-
-
-def _field_checksums(rows: list[dict], schema: dict, key: str) -> tuple[dict[str, str], str]:
-    ordered = sorted(rows, key=lambda row: primary_key_sort(row[key]))
-    fields = {
-        name: sha256_text(canonical_json([row.get(name) for row in ordered]))
-        for name in schema
-    }
-    return fields, sha256_text(canonical_json(fields))
-
-
-def _compare_keys(
-    before: TableData, after: TableData, key: str
-) -> tuple[dict, list, list, list, int]:
-    left = _keyed(before.rows, key)
-    right = _keyed(after.rows, key)
-    left_only = [left[marker][key] for marker in left.keys() - right.keys()]
-    right_only = [right[marker][key] for marker in right.keys() - left.keys()]
-    left_only.sort(key=primary_key_sort)
-    right_only.sort(key=primary_key_sort)
-    shared = sorted(left.keys() & right.keys(), key=lambda marker: primary_key_sort(left[marker][key]))
-    field_order = list(before.schema)
-    field_order.extend(name for name in after.schema if name not in before.schema)
-    modified: list[dict] = []
-    for marker in shared:
-        changes = [
-            {"name": name, "before": left[marker].get(name), "after": right[marker].get(name)}
-            for name in field_order
-            if left[marker].get(name) != right[marker].get(name)
-        ]
-        if changes:
-            modified.append({"key": left[marker][key], "fields": changes})
-    unchanged = len(shared) - len(modified)
-    key_evidence = {
-        "before_keys": len(left),
-        "after_keys": len(right),
-        "missing_in_after": left_only,
-        "extra_in_after": right_only,
-    }
-    return key_evidence, left_only, right_only, modified, unchanged
-
-
-def _checksum_evidence(
-    before: TableData, after: TableData, key: str, common: list[tuple]
-) -> tuple[bool, list, list]:
-    details: list[dict] = []
-    mismatches: list[dict] = []
-    for marker in common:
-        before_fields, before_digest = _field_checksums(
-            before.rows_by_partition[marker], before.schema, key
-        )
-        after_fields, after_digest = _field_checksums(
-            after.rows_by_partition[marker], after.schema, key
-        )
-        mismatched = sorted(
-            name for name in set(before_fields) | set(after_fields)
-            if before_fields.get(name) != after_fields.get(name)
-        )
-        partition = _partition_payload(marker)
-        details.append({
-            "partition": partition,
-            "before_digest": before_digest,
-            "after_digest": after_digest,
-            "mismatched_fields": mismatched,
-        })
-        if mismatched:
-            mismatches.append({"partition": partition, "mismatched_fields": mismatched})
-    return not mismatches, details, mismatches
-
-
-def _fingerprint(table: str, key: str, before: TableData, after: TableData) -> str:
-    payload = {
-        "table": table,
-        "key": key,
-        "before": {
-            "schema": schema_as_list(before.schema),
-            "partitions": before.partitions,
-            "rows": stable_rows(before.rows, key),
-        },
-        "after": {
-            "schema": schema_as_list(after.schema),
-            "partitions": after.partitions,
-            "rows": stable_rows(after.rows, key),
+def _expected_block(
+    table: str,
+    expectations: ExpectedChanges,
+    expected_rows: list[dict],
+    expected_partition_mismatches: list[dict],
+    expected_field_count: int,
+    expected_partition_fields: int,
+) -> dict:
+    return {
+        "declaration": expectations.metadata(table),
+        "modified_rows": expected_rows,
+        "partition_fields": expected_partition_mismatches,
+        "counts": {
+            "modified_rows": len(expected_rows),
+            "fields": expected_field_count,
+            "partition_fields": expected_partition_fields,
+            "partition_count": len(expected_partition_mismatches),
         },
     }
-    return sha256_text(canonical_json(payload))[:16]
 
 
 def run_audit(
@@ -170,17 +73,21 @@ def run_audit(
     key: str | None = None,
     backend_name: str | None = None,
     clock: Callable[[], str] | None = None,
+    expected_changes: ExpectedChanges | dict | list | str | Path | None = None,
 ) -> dict:
-    """Run the audit, write JSON/Markdown artifacts, and return the full report."""
+    """Run the audit, write JSON/Markdown artifacts, and return the full report.
+
+    ``expected_changes`` may be a declaration path, a parsed document, or an
+    ``ExpectedChanges`` instance. Declared field changes are reported as
+    expected and no longer force ``residual_diff``; everything else keeps the
+    original residual semantics. The declaration content participates in the
+    ``report_id`` fingerprint.
+    """
     if not NAME_RE.fullmatch(table):
         raise DataError(f"invalid table name: {table!r}")
+    expectations = load_expected_changes(expected_changes)
     backend = config.resolve_backend(backend_name)
-    before_path = Path(before_root).resolve()
-    after_path = Path(after_root).resolve()
-    if not before_path.is_dir():
-        raise NotFoundError(f"before table directory does not exist: {before_path}")
-    if not after_path.is_dir():
-        raise NotFoundError(f"after table directory does not exist: {after_path}")
+    before_path, after_path = _resolve_roots(before_root, after_root)
     before = read_table_data(backend, before_path)
     after = read_table_data(backend, after_path)
     primary_key = key or config.table_key(table)
@@ -192,23 +99,32 @@ def run_audit(
                 "after_has_key": primary_key in after.schema,
             },
         )
+    if expectations is not None:
+        expectations.validate_table(table, before.schema, after.schema, primary_key)
 
-    schema_ok, schema_evidence = _schema_evidence(before.schema, after.schema)
-    partition_ok, partition_evidence, missing_parts, extra_parts = _partition_evidence(
-        before, after
+    schema_ok, schema_evidence_block = schema_evidence(before.schema, after.schema)
+    partition_ok, partition_evidence_block, missing_parts, extra_parts = (
+        partition_evidence(before, after)
     )
     row_count_ok = before.row_count == after.row_count
-    key_evidence, missing_keys, extra_keys, modified, unchanged = _compare_keys(
+    key_evidence, missing_keys, extra_keys, modified, unchanged = compare_keys(
         before, after, primary_key
     )
     key_ok = not missing_keys and not extra_keys
-    common = sorted(set(before.rows_by_partition) & set(after.rows_by_partition))
-    checksum_ok, checksum_details, checksum_mismatches = _checksum_evidence(
-        before, after, primary_key, common
+    expected_rows, residual_rows = (
+        expectations.split_modified_rows(table, modified)
+        if expectations is not None
+        else ([], modified)
     )
+    expected_field_count = sum(len(item["fields"]) for item in expected_rows)
+    common = sorted(set(before.rows_by_partition) & set(after.rows_by_partition))
+    (
+        checksum_ok, checksum_details, checksum_mismatches,
+        expected_partition_mismatches, expected_partition_fields,
+    ) = checksum_evidence(before, after, primary_key, common, table, expectations)
     checks = [
-        _check("schema", schema_ok, schema_evidence),
-        _check("partition_structure", partition_ok, partition_evidence),
+        _check("schema", schema_ok, schema_evidence_block),
+        _check("partition_structure", partition_ok, partition_evidence_block),
         _check("row_count", row_count_ok, {
             "before_rows": before.row_count, "after_rows": after.row_count,
             "delta": after.row_count - before.row_count,
@@ -222,7 +138,7 @@ def run_audit(
     structural = not schema_ok or not partition_ok
     residual = (
         not row_count_ok or not key_ok or not checksum_ok
-        or bool(missing_keys) or bool(extra_keys) or bool(modified)
+        or bool(missing_keys) or bool(extra_keys) or bool(residual_rows)
     )
     if structural:
         status = "structural_mismatch"
@@ -233,7 +149,7 @@ def run_audit(
 
     report = {
         "format": 1,
-        "report_id": f"rpt-{_fingerprint(table, primary_key, before, after)}",
+        "report_id": f"rpt-{fingerprint(table, primary_key, before, after, expectations)}",
         "table": table,
         "key": primary_key,
         "status": status,
@@ -251,21 +167,29 @@ def run_audit(
             "extra_in_after": len(extra_keys),
             "modified_rows": len(modified),
             "unchanged_rows": unchanged,
+            "expected_fields": expected_field_count,
+            "residual_modified_rows": len(residual_rows),
         },
         "residual": {
             "missing_in_after": missing_keys,
             "extra_in_after": extra_keys,
-            "modified_rows": modified,
-            "missing_partitions": [_partition_payload(item) for item in missing_parts],
-            "extra_partitions": [_partition_payload(item) for item in extra_parts],
+            "modified_rows": residual_rows,
+            "missing_partitions": [partition_payload(item) for item in missing_parts],
+            "extra_partitions": [partition_payload(item) for item in extra_parts],
         },
         "partition_checksum_mismatches": checksum_mismatches,
     }
-    report["summary"] = {
-        "consistent": "all structural, count, key and checksum checks passed",
-        "residual_diff": "structure matches but row or checksum differences remain",
-        "structural_mismatch": "schema or partition structure differs",
-    }[status]
+    if expectations is not None:
+        report["expected_changes"] = _expected_block(
+            table, expectations, expected_rows, expected_partition_mismatches,
+            expected_field_count, expected_partition_fields,
+        )
+    report["summary"] = SUMMARY[status]
+    if status == "consistent" and expected_field_count:
+        report["summary"] = (
+            f"all residual checks passed; {expected_field_count} declared "
+            "field change(s) were within expectation"
+        )
     json_path, markdown_path = write_audit_report(config.reports_dir, report)
     report["artifacts"] = {
         "json_report": str(json_path),
